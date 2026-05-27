@@ -4,7 +4,8 @@
 
 --use_cuda: True
 --log_interval: 100
---model: DCASE2023T2-AE
+##--model: DCASE2023T2-AE
+--model: FRAME
 --score: MSE
 --seed: 13711
 --is_auto_download: False

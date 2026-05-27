@@ -21,4 +21,7 @@ DCASE2026T2:
     valveEmu:
       dev:
         - "00"
+    AutoTrash:        
+      dev:
+        - "00"
   section_keyword: section

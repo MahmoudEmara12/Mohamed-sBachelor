@@ -22,11 +22,11 @@ tag="${tag}${i}_"
 done
 tag="${tag})"
 
-python3 train.py \
+python train.py \
     --dataset=${dataset} \
     ${dev_eval} \
     -tag=${tag} \
     --use_ids ${id} \
     --score ${score} \
     --test_only \
-    --mono=${mono} \
+    --mono ${mono} \

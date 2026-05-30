@@ -1,14 +1,16 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import numpy as np
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from networks.base_model import BaseModel
 
 
 # =========================================================
-# GRL (Gradient Reversal Layer)
+# GRADIENT REVERSAL
 # =========================================================
 class GradReverse(torch.autograd.Function):
     @staticmethod
@@ -26,10 +28,10 @@ def grad_reverse(x, alpha=1.0):
 
 
 # =========================================================
-# NETWORK COMPONENTS
+# MODEL
 # =========================================================
 class Encoder(nn.Module):
-    def __init__(self, input_dim, latent_dim):
+    def __init__(self, input_dim, latent_dim=32):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
@@ -70,7 +72,7 @@ class DomainClassifier(nn.Module):
 
 
 # =========================================================
-# FULL MODEL
+# NETWORK
 # =========================================================
 class FRAE_DANNNet(nn.Module):
     def __init__(self, input_dim, latent_dim=32):
@@ -80,24 +82,24 @@ class FRAE_DANNNet(nn.Module):
         self.decoder = Decoder(latent_dim, input_dim)
         self.domain = DomainClassifier(latent_dim)
 
+        # IMPORTANT: required by train.py (DO NOT REMOVE)
+        self.register_buffer("cov_source", torch.zeros(latent_dim, latent_dim))
+        self.register_buffer("cov_target", torch.zeros(latent_dim, latent_dim))
+
     def forward(self, x, alpha=0.0):
         z = self.encoder(x)
         recon = self.decoder(z)
-
         dom = self.domain(grad_reverse(z, alpha))
-
         return recon, z, dom
 
 
 # =========================================================
-# MAIN WRAPPER
+# MAIN MODEL
 # =========================================================
 class FRAE_DANN(BaseModel):
 
     def __init__(self, args, train=True, test=False):
         super().__init__(args=args, train=train, test=test)
-
-        self.latent_dim = 32
 
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -111,117 +113,83 @@ class FRAE_DANN(BaseModel):
             eta_min=args.learning_rate * 0.05
         )
 
-        # modern AMP (no warnings)
+        # FIXED AMP
         self.scaler = torch.amp.GradScaler("cuda")
 
-        # Mahalanobis stats (inference only)
-        self.mean = None
-        self.inv_cov = None
+        self.block_size = None
 
     # -----------------------------------------------------
     def init_model(self):
+        self.block_size = int(self.data.input_dim)
+
         return FRAE_DANNNet(
             input_dim=self.data.input_dim,
-            latent_dim=self.latent_dim
+            latent_dim=32
         )
 
     # -----------------------------------------------------
     def train(self, epoch):
 
-        self.model.train()
-        total_loss = 0.0
+        is_cov_epoch = (epoch == self.args.epochs + 1)
 
-        alpha = min(epoch / max(self.args.epochs, 1), 1.0)
+        if is_cov_epoch:
+            print("\n[INFO] COVARIANCE COMPUTATION PHASE")
+            self.model.eval()
+            torch.set_grad_enabled(False)
+
+            cov_x_source = torch.zeros((32, 32), device=self.device)
+            cov_x_target = torch.zeros_like(cov_x_source)
+
+            num_source = 0
+            num_target = 0
+        else:
+            self.model.train()
 
         for batch in self.train_loader:
 
             x = batch[0].to(self.device).float()
 
-            self.optimizer.zero_grad(set_to_none=True)
+            if is_cov_epoch:
+                recon, z, _ = self.model(x)
+
+                is_target = ["target" in n for n in batch[3]]
+                is_source = np.logical_not(is_target)
+
+                # safe covariance accumulation (NO None crashes)
+                if z is not None:
+                    if any(is_source):
+                        cov_x_source += torch.cov(z[torch.tensor(is_source)].T).detach()
+                        num_source += sum(is_source)
+
+                    if any(is_target):
+                        cov_x_target += torch.cov(z[torch.tensor(is_target)].T).detach()
+                        num_target += sum(is_target)
+
+                continue
+
+            self.optimizer.zero_grad()
 
             with torch.amp.autocast("cuda"):
+                recon, z, dom = self.model(x, alpha=0.5)
 
-                recon, z, dom = self.model(x, alpha)
-
-                # reconstruction loss (core ASD objective)
-                recon_loss = F.mse_loss(recon, x)
-
-                # domain loss (only if labels exist; otherwise neutral)
-                if len(batch) > 2:
-                    domain_labels = torch.zeros(
-                        x.size(0),
-                        dtype=torch.long,
-                        device=self.device
-                    )
-                    dom_loss = F.cross_entropy(dom, domain_labels)
-                else:
-                    dom_loss = 0.0
-
-                loss = recon_loss + 0.1 * dom_loss
+                loss = F.mse_loss(recon, x)
 
             self.scaler.scale(loss).backward()
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
-            total_loss += loss.item()
-
         self.scheduler.step()
 
-        print(f"[Epoch {epoch}] loss={total_loss / len(self.train_loader):.6f}")
+        # finalize covariance safely
+        if is_cov_epoch:
+            cov_x_source /= max(num_source, 1)
+            cov_x_target /= max(num_target, 1)
+
+            self.model.cov_source.copy_(cov_x_source)
+            self.model.cov_target.copy_(cov_x_target)
+
+            print("[INFO] Covariance computed safely")
 
     # -----------------------------------------------------
-    # MAHALANOBIS (POST-TRAIN ONLY)
-    # -----------------------------------------------------
-    def build_covariance(self):
-
-        self.model.eval()
-        feats = []
-
-        with torch.no_grad():
-            for batch in self.train_loader:
-                x = batch[0].to(self.device).float()
-                _, z, _ = self.model(x)
-                feats.append(z.cpu())
-
-        feats = torch.cat(feats, dim=0)
-
-        self.mean = feats.mean(0)
-
-        centered = feats - self.mean
-        cov = (centered.T @ centered) / (len(feats) - 1)
-
-        shrink = 0.05
-        cov = (1 - shrink) * cov + shrink * torch.eye(cov.size(0))
-
-        self.inv_cov = torch.linalg.pinv(cov)
-
-        self.mean = self.mean.to(self.device)
-        self.inv_cov = self.inv_cov.to(self.device)
-
-        print("[INFO] Mahalanobis statistics built")
-
-    # -----------------------------------------------------
-    def test(self):
-
-        self.model.eval()
-        self.build_covariance()
-
-        scores = []
-
-        with torch.no_grad():
-            for batch in self.test_loader:
-
-                x = batch[0].to(self.device).float()
-                _, z, _ = self.model(x)
-
-                diff = z - self.mean
-
-                score = torch.sum(
-                    (diff @ self.inv_cov) * diff,
-                    dim=1
-                )
-
-                scores.extend(score.cpu().numpy())
-
-        print("[INFO] Testing complete")
-        return scores
+    def loss_fn(self, recon_x, x):
+        return F.mse_loss(recon_x, x, reduction="none")

@@ -84,10 +84,6 @@ class FRAE_DANNNet(nn.Module):
         self.register_buffer("cov_source", torch.zeros(latent_dim, latent_dim))
         self.register_buffer("cov_target", torch.zeros(latent_dim, latent_dim))
 
-        # IMPORTANT: required by train.py (DO NOT REMOVE)
-        self.register_buffer("cov_source", torch.zeros(latent_dim, latent_dim))
-        self.register_buffer("cov_target", torch.zeros(latent_dim, latent_dim))
-
     def forward(self, x, alpha=0.0):
         z = self.encoder(x)
         recon = self.decoder(z)

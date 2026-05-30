@@ -4,14 +4,14 @@
 
 --use_cuda: True
 --log_interval: 100
-##--model: DCASE2023T2-AE
---model: FRAME
---score: MSE
+##--model: DCASE2023T2-AE FRAME CNN
+--model: FRAE_DANN
+--score: MAHALA
 --seed: 13711
 --is_auto_download: False
 
 --max_fpr: 0.1
---decision_threshold: 0.9
+--decision_threshold: 0.001
 
 # feature
 --n_mels: 128

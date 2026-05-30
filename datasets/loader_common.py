@@ -29,6 +29,7 @@ import time
 import datetime
 from enum import Enum, auto
 import soundfile as sf
+import yaml
 
 from tools.rename_eval_wav import copy_wav as rename_wav
 ########################################################################

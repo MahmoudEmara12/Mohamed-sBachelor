@@ -81,6 +81,8 @@ class FRAE_DANNNet(nn.Module):
         self.encoder = Encoder(input_dim, latent_dim)
         self.decoder = Decoder(latent_dim, input_dim)
         self.domain = DomainClassifier(latent_dim)
+        self.register_buffer("cov_source", torch.zeros(latent_dim, latent_dim))
+        self.register_buffer("cov_target", torch.zeros(latent_dim, latent_dim))
 
         # IMPORTANT: required by train.py (DO NOT REMOVE)
         self.register_buffer("cov_source", torch.zeros(latent_dim, latent_dim))

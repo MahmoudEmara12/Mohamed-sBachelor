@@ -1,20 +1,28 @@
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import pandas as pd
 import numpy as np
+import scipy
+from sklearn import metrics
+import csv
+from tqdm import tqdm
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from networks.base_model import BaseModel
 
+from networks.criterion.mahala import (
+    cov_v,
+    loss_function_mahala,
+    calc_inv_cov
+)
 
 # =========================================================
-# GRADIENT REVERSAL LAYER
+# GRADIENT REVERSAL
 # =========================================================
 class GradReverse(torch.autograd.Function):
-
     @staticmethod
     def forward(ctx, x, alpha):
         ctx.alpha = alpha
@@ -30,107 +38,53 @@ def grad_reverse(x, alpha=1.0):
 
 
 # =========================================================
-# AUGMENTATION (SpecAugment style)
+# AUGMENTATION
 # =========================================================
 def augment(x, frames, n_mels):
-
-    # x shape:
-    # (B, frames, n_mels)
-
-    # Gaussian noise
     x = x + torch.randn_like(x) * 0.02
 
-    # Random amplitude scaling
-    scale = torch.empty(
-        x.size(0),
-        1,
-        1,
-        device=x.device
-    ).uniform_(0.9, 1.1)
-
+    scale = torch.empty(x.size(0), 1, 1, device=x.device).uniform_(0.9, 1.1)
     x = x * scale
 
-    # Frequency masking
-    mask_len = np.random.randint(
-        0,
-        max(1, n_mels // 6)
-    )
-
+    mask_len = np.random.randint(0, max(1, n_mels // 6))
     if mask_len > 0:
-
-        f0 = np.random.randint(
-            0,
-            n_mels - mask_len + 1
-        )
-
+        f0 = np.random.randint(0, n_mels - mask_len + 1)
         x[:, :, f0:f0 + mask_len] = 0
 
-    # Time masking
-    mask_len_t = np.random.randint(
-        0,
-        max(1, frames // 6)
-    )
-
+    mask_len_t = np.random.randint(0, max(1, frames // 6))
     if mask_len_t > 0:
-
-        t0 = np.random.randint(
-            0,
-            frames - mask_len_t + 1
-        )
-
+        t0 = np.random.randint(0, frames - mask_len_t + 1)
         x[:, t0:t0 + mask_len_t, :] = 0
 
     return x
 
 
 # =========================================================
-# ENCODER
+# MODEL COMPONENTS
 # =========================================================
 class Encoder(nn.Module):
-
-    def __init__(
-        self,
-        input_dim,
-        hidden=256,
-        latent_dim=32
-    ):
+    def __init__(self, input_dim, hidden=256, latent_dim=32):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
             nn.LayerNorm(hidden),
             nn.GELU(),
-
             nn.Linear(hidden, hidden),
             nn.LayerNorm(hidden),
             nn.GELU(),
-
             nn.Linear(hidden, latent_dim)
         )
 
     def forward(self, x):
-
-        z = self.net(x)
-
-        return F.normalize(z, dim=1)
+        return F.normalize(self.net(x), dim=1)
 
 
-# =========================================================
-# DECODER
-# =========================================================
 class Decoder(nn.Module):
-
-    def __init__(
-        self,
-        latent_dim,
-        output_dim
-    ):
+    def __init__(self, latent_dim, output_dim):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Linear(latent_dim, 128),
             nn.GELU(),
-
             nn.Linear(128, output_dim)
         )
 
@@ -138,22 +92,12 @@ class Decoder(nn.Module):
         return self.net(z)
 
 
-# =========================================================
-# DOMAIN CLASSIFIER
-# =========================================================
 class DomainClassifier(nn.Module):
-
-    def __init__(
-        self,
-        latent_dim,
-        n_domains=2
-    ):
+    def __init__(self, latent_dim, n_domains=2):
         super().__init__()
-
         self.net = nn.Sequential(
             nn.Linear(latent_dim, 64),
             nn.ReLU(),
-
             nn.Linear(64, n_domains)
         )
 
@@ -161,125 +105,50 @@ class DomainClassifier(nn.Module):
         return self.net(z)
 
 
-# =========================================================
-# FRAE + DOMAIN ADVERSARIAL NETWORK
-# =========================================================
 class FRAE_DANNNet(nn.Module):
-
-    def __init__(
-        self,
-        input_dim,
-        frames,
-        n_mels,
-        latent_dim=32
-    ):
+    def __init__(self, input_dim, frames, n_mels, latent_dim=32):
         super().__init__()
+        self.encoder = Encoder(input_dim, 256, latent_dim)
+        self.decoder = Decoder(latent_dim, input_dim)
+        self.domain_clf = DomainClassifier(latent_dim)
 
-        self.encoder = Encoder(
-            input_dim=input_dim,
-            hidden=256,
-            latent_dim=latent_dim
-        )
-
-        self.decoder = Decoder(
-            latent_dim=latent_dim,
-            output_dim=input_dim
-        )
-
-        self.domain_clf = DomainClassifier(
-            latent_dim=latent_dim
-        )
-
-        self.freq_weights = nn.Parameter(
-            torch.linspace(0.8, 1.2, n_mels)
-        )
+        self.freq_weights = nn.Parameter(torch.linspace(0.8, 1.2, n_mels))
 
     def forward(self, x, alpha=0.0):
-
         z = self.encoder(x)
-
         recon = self.decoder(z)
-
         rev_z = grad_reverse(z, alpha)
-
-        domain_logits = self.domain_clf(rev_z)
-
-        return recon, z, domain_logits
+        dom = self.domain_clf(rev_z)
+        return recon, z, dom
 
 
 # =========================================================
-# INFO-NCE CONTRASTIVE LOSS
+# LOSS
 # =========================================================
-def contrastive_loss(
-    z1,
-    z2,
-    temperature=0.5
-):
-
+def contrastive_loss(z1, z2, temperature=0.5):
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
 
-    representations = torch.cat(
-        [z1, z2],
-        dim=0
-    )
+    reps = torch.cat([z1, z2], dim=0)
+    sim = torch.matmul(reps, reps.T) / temperature
 
-    similarity_matrix = torch.matmul(
-        representations,
-        representations.T
-    )
+    bsz = z1.size(0)
+    labels = torch.arange(bsz, device=z1.device)
+    labels = torch.cat([labels + bsz, labels])
 
-    similarity_matrix = (
-        similarity_matrix / temperature
-    )
+    mask = torch.eye(2 * bsz, device=z1.device).bool()
+    sim = sim.masked_fill(mask, -1e4)
 
-    batch_size = z1.size(0)
-
-    labels = torch.arange(
-        batch_size,
-        device=z1.device
-    )
-
-    labels = torch.cat([
-        labels + batch_size,
-        labels
-    ])
-
-    mask = torch.eye(
-        2 * batch_size,
-        dtype=torch.bool,
-        device=z1.device
-    )
-
-    similarity_matrix = similarity_matrix.masked_fill(
-        mask,
-        -1e4
-    )
-
-    loss = F.cross_entropy(
-        similarity_matrix,
-        labels
-    )
-
-    return loss
+    return F.cross_entropy(sim, labels)
 
 
 # =========================================================
-# BASEMODEL WRAPPER
+# MAIN MODEL (DCASE-COMPATIBLE)
 # =========================================================
 class FRAE_DANN(BaseModel):
 
-    def __init__(
-        self,
-        args,
-        train=True,
-        test=False
-    ):
-        super().__init__(
-            args=args,
-            train=train,
-            test=test
-        )
+    def __init__(self, args, train=True, test=False):
+        super().__init__(args=args, train=train, test=test)
 
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -295,399 +164,160 @@ class FRAE_DANN(BaseModel):
 
         self.scaler = torch.cuda.amp.GradScaler()
 
-        self.best_hmean = 0.0
-        self.early_stop_patience = 20
+        self.block_size = None
 
-        # Mahalanobis parameters
-        self.mean_s = None
-        self.inv_cov_s = None
-
-        self.mean_t = None
-        self.inv_cov_t = None
-
-    # -----------------------------------------------------
-    # INIT MODEL
     # -----------------------------------------------------
     def init_model(self):
-
+        self.block_size = self.data.height
         return FRAE_DANNNet(
             input_dim=self.data.input_dim,
             frames=self.args.frames,
-            n_mels=self.args.n_mels,
-            latent_dim=32
+            n_mels=self.args.n_mels
         )
 
-    # -----------------------------------------------------
-    # BUILD COVARIANCE
-    # -----------------------------------------------------
-    @staticmethod
-    def _build_covariance(
-        feats,
-        shrinkage=0.1
-    ):
-
-        mean = feats.mean(dim=0)
-
-        centered = feats - mean
-
-        cov = (
-            centered.T @ centered
-        ) / max(centered.size(0) - 1, 1)
-
-        eye = torch.eye(
-            cov.size(0),
-            device=cov.device
-        )
-
-        cov = (
-            (1 - shrinkage) * cov
-            + shrinkage * eye
-        )
-
-        inv_cov = torch.linalg.pinv(cov)
-
-        return mean, inv_cov
-
-    # -----------------------------------------------------
-    # TRAIN
     # -----------------------------------------------------
     def train(self, epoch):
 
-        self.model.train()
+        # === covariance pass exactly like baseline ===
+        is_cov_epoch = (epoch == self.args.epochs + 1)
 
-        total_loss = 0.0
+        if is_cov_epoch:
+            print("\n[INFO] COVARIANCE COMPUTATION PHASE")
+            self.model.eval()
+            torch.set_grad_enabled(False)
 
-        alpha = (
-            epoch / self.args.epochs
-        ) ** 2
+            cov_x_source = torch.zeros((self.block_size, self.block_size), device=self.device)
+            cov_x_target = torch.zeros_like(cov_x_source)
 
-        for batch in self.train_loader:
+            num_source = 0
+            num_target = 0
+        else:
+            self.model.train()
 
-            x = batch[0].to(self.device).float()
+        train_loader = self.train_loader
 
-            d = batch[2].to(self.device).long()
+        for batch in tqdm(train_loader):
 
-            batch_size = x.size(0)
+            data = batch[0].to(self.device).float()
+            if data.shape[0] <= 1:
+                continue
 
-            # Reshape into spectrogram
-            x_spec = x.view(
-                batch_size,
-                self.args.frames,
-                self.args.n_mels
-            )
+            data_name_list = batch[3]
 
-            # Two augmented views
-            x1 = augment(
-                x_spec.clone(),
-                self.args.frames,
-                self.args.n_mels
-            )
+            is_target = ["target" in n for n in data_name_list]
+            is_source = np.logical_not(is_target).tolist()
 
-            x2 = augment(
-                x_spec.clone(),
-                self.args.frames,
-                self.args.n_mels
-            )
+            machine_id = torch.argmax(batch[2], dim=1).to(self.device)
 
-            x1 = x1.view(batch_size, -1)
-            x2 = x2.view(batch_size, -1)
+            recon, z = self.model(data)
 
-            self.optimizer.zero_grad(
-                set_to_none=True
-            )
-
-            with torch.cuda.amp.autocast():
-
-                recon1, z1, dom_logits1 = self.model(
-                    x1,
-                    alpha
+            if is_cov_epoch:
+                score_2d, cov_s, cov_t = loss_function_mahala(
+                    recon_x=recon,
+                    x=data,
+                    block_size=self.block_size,
+                    update_cov=True,
+                    reduction=False,
+                    is_source_list=is_source,
+                    is_target_list=is_target
                 )
 
-                _, z2, _ = self.model(
-                    x2,
-                    alpha
-                )
+                cov_x_source += cov_v(cov_s, 1)
+                cov_x_target += cov_v(cov_t, 1)
 
-                # Reconstruction loss
-                x2d = x.view(
-                    batch_size,
-                    self.args.frames,
-                    self.args.n_mels
-                )
+                num_source += sum(is_source)
+                num_target += sum(is_target)
 
-                r2d = recon1.view(
-                    batch_size,
-                    self.args.frames,
-                    self.args.n_mels
-                )
+                continue
 
-                w = F.softmax(
-                    self.model.freq_weights,
-                    dim=0
-                )
+            # === normal training ===
+            score = self.loss_fn(recon, data)
+            loss = score.mean()
 
-                w = w.unsqueeze(0).unsqueeze(0)
-
-                recon_loss = (
-                    ((x2d - r2d) ** 2) * w
-                ).mean()
-
-                # Contrastive loss
-                cont_loss = contrastive_loss(
-                    z1,
-                    z2
-                )
-
-                # Domain adversarial loss
-                dom_loss = F.cross_entropy(
-                    dom_logits1,
-                    d.view(-1)
-                )
-
-                # Final loss
-                loss = (
-                    recon_loss
-                    + 0.3 * cont_loss
-                    + 0.1 * dom_loss
-                )
-
+            self.optimizer.zero_grad()
             self.scaler.scale(loss).backward()
-
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                5.0
-            )
-
             self.scaler.step(self.optimizer)
-
             self.scaler.update()
-
-            total_loss += loss.item()
 
         self.scheduler.step()
 
-        avg_loss = (
-            total_loss / len(self.train_loader)
-        )
+        # finalize covariance like baseline
+        if is_cov_epoch:
+            cov_x_source /= max(num_source - 1, 1)
+            cov_x_target /= max(num_target - 1, 1)
 
-        print(
-            f"[Epoch {epoch}] "
-            f"loss={avg_loss:.5f}"
-        )
+            self.model.cov_source.data = cov_x_source
+            self.model.cov_target.data = cov_x_target
 
-        return False
-
-    # -----------------------------------------------------
-    # BUILD MAHALANOBIS
-    # -----------------------------------------------------
-    def build_covariance(self):
-
-        self.model.eval()
-
-        feats_s = []
-        feats_t = []
-
-        with torch.inference_mode():
-
-            for batch in self.train_loader:
-
-                x = batch[0].to(self.device).float()
-
-                _, z, _ = self.model(x)
-
-                z_cpu = z.cpu()
-
-                # Domains
-                if len(batch) > 2:
-
-                    d = batch[2]
-
-                    if isinstance(d, torch.Tensor):
-                        d = d.cpu().numpy()
-                    else:
-                        d = np.zeros(z_cpu.size(0))
-
-                else:
-                    d = np.zeros(z_cpu.size(0))
-
-                for i, dom in enumerate(d):
-
-                    if dom == 1:
-                        feats_t.append(z_cpu[i])
-                    else:
-                        feats_s.append(z_cpu[i])
-
-        # Safety fallback
-        if len(feats_s) == 0:
-            feats_s = feats_t.copy()
-
-        if len(feats_t) == 0:
-            feats_t = feats_s.copy()
-
-        feats_s = torch.stack(feats_s)
-        feats_t = torch.stack(feats_t)
-
-        self.mean_s, self.inv_cov_s = (
-            self._build_covariance(feats_s)
-        )
-
-        self.mean_t, self.inv_cov_t = (
-            self._build_covariance(feats_t)
-        )
-
-        self.mean_s = self.mean_s.to(self.device)
-        self.inv_cov_s = self.inv_cov_s.to(self.device)
-
-        self.mean_t = self.mean_t.to(self.device)
-        self.inv_cov_t = self.inv_cov_t.to(self.device)
-
-        print("[INFO] Source covariance built")
-        print("[INFO] Target covariance built")
+            calc_inv_cov(self.model, self.device)
 
     # -----------------------------------------------------
-    # TEST
+    def loss_fn(self, recon_x, x):
+        return F.mse_loss(recon_x, x.view(recon_x.shape), reduction="none")
+
     # -----------------------------------------------------
     def test(self):
 
+        anm_score_figdata = None
+        mode = self.data.mode
+
+        if not os.path.exists(self.model_path):
+            print("Model not found")
+            return
+
+        self.model.load_state_dict(torch.load(self.model_path))
         self.model.eval()
 
-        self.build_covariance()
+        inv_cov_s, inv_cov_t = calc_inv_cov(self.model, self.device)
 
-        all_mse = []
-        all_mahal = []
-
-        all_labels = []
-        all_domains = []
-        all_names = []
-
-        with torch.inference_mode():
-
-            for section_loader in self.test_loader:
-
-                for batch in section_loader:
-
-                    x = batch[0].to(self.device).float()
-
-                    recon, z, _ = self.model(x)
-
-                    # Reconstruction score
-                    x2d = x.view(
-                        x.size(0),
-                        self.args.frames,
-                        self.args.n_mels
-                    )
-
-                    r2d = recon.view(
-                        x.size(0),
-                        self.args.frames,
-                        self.args.n_mels
-                    )
-
-                    w = F.softmax(
-                        self.model.freq_weights,
-                        dim=0
-                    )
-
-                    w = w.unsqueeze(0).unsqueeze(0)
-
-                    mse = (
-                        ((x2d - r2d) ** 2) * w
-                    ).mean(dim=(1, 2))
-
-                    # Mahalanobis source
-                    diff_s = z - self.mean_s
-
-                    mahal_s = torch.sum(
-                        (diff_s @ self.inv_cov_s)
-                        * diff_s,
-                        dim=1
-                    )
-
-                    # Mahalanobis target
-                    diff_t = z - self.mean_t
-
-                    mahal_t = torch.sum(
-                        (diff_t @ self.inv_cov_t)
-                        * diff_t,
-                        dim=1
-                    )
-
-                    # Minimum distance
-                    mahal = torch.minimum(
-                        mahal_s,
-                        mahal_t
-                    )
-
-                    all_mse.extend(
-                        mse.cpu().numpy()
-                    )
-
-                    all_mahal.extend(
-                        mahal.cpu().numpy()
-                    )
-
-                    y = (
-                        batch[1].cpu().numpy()
-                        if len(batch) > 1
-                        else np.zeros(x.size(0))
-                    )
-
-                    d = (
-                        batch[2].cpu().numpy()
-                        if len(batch) > 2
-                        else np.zeros(x.size(0))
-                    )
-
-                    names = (
-                        batch[3]
-                        if len(batch) > 3
-                        else [
-                            f"s{i}"
-                            for i in range(x.size(0))
-                        ]
-                    )
-
-                    all_labels.extend(y)
-                    all_domains.extend(d)
-                    all_names.extend(names)
-
-        # Save scores
-        os.makedirs(
-            "results",
-            exist_ok=True
+        decision_threshold = self.calc_decision_threshold(
+            score_distr_file_path=self.mse_score_distr_file_path
         )
 
-        df = pd.DataFrame({
-            "anon": all_names,
-            "mse_score": all_mse,
-            "mahal_score": all_mahal,
-            "label": all_labels,
-            "domain": all_domains
-        })
+        for idx, loader in enumerate(self.test_loader):
 
-        df.to_csv(
-            "frae_all_scores.csv",
-            index=False
-        )
+            section_name = f"section_{self.data.section_id_list[idx]}"
+            anomaly_list = []
+            decision_list = []
 
-        print(
-            "\n[OK] FRAE+DANN evaluation complete"
-        )
+            y_pred, y_true = [], []
 
-        print(
-            "Saved → frae_all_scores.csv"
-        )
+            for batch in loader:
 
-        print(
-            f"MSE range: "
-            f"{min(all_mse):.6f} "
-            f"→ "
-            f"{max(all_mse):.6f}"
-        )
+                data = batch[0].to(self.device).float()
+                recon, _ = self.model(data)
 
-        print(
-            f"Mahal range: "
-            f"{min(all_mahal):.6f} "
-            f"→ "
-            f"{max(all_mahal):.6f}"
-        )
+                loss_s, num = loss_function_mahala(
+                    recon, data, self.block_size,
+                    cov=inv_cov_s, use_precision=True, reduction=False
+                )
+
+                loss_t, num = loss_function_mahala(
+                    recon, data, self.block_size,
+                    cov=inv_cov_t, use_precision=True, reduction=False
+                )
+
+                score = min(
+                    self.loss_reduction_1d(loss_s).mean().item(),
+                    self.loss_reduction_1d(loss_t).mean().item()
+                )
+
+                y_pred.append(score)
+
+                basename = batch[3][0]
+                anomaly_list.append([basename, score])
+
+                decision_list.append([basename, int(score > decision_threshold)])
+
+                if mode:
+                    y_true.append(batch[1][0].item())
+
+            result_dir = self.result_dir if self.args.dev else self.eval_data_result_dir
+
+            save_csv(result_dir / f"anomaly_score_{section_name}.csv", anomaly_list)
+            save_csv(result_dir / f"decision_{section_name}.csv", decision_list)
+
+
+def save_csv(path, data):
+    with open(path, "w", newline="") as f:
+        csv.writer(f).writerows(data)

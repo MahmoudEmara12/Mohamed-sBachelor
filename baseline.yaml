@@ -26,7 +26,7 @@
 
 # fit
 --batch_size: 256
---epochs: 100
+--epochs: 40
 -lr: 0.001
 --shuffle: True
 --validation_split: 0.1

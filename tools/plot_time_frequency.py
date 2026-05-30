@@ -1,7 +1,7 @@
 import argparse, os, sys
 from tools.plot_common import Figdata, show_figs
 
-# from datasets.datasets import Datasets
+from datasets.datasets import Datasets
 
 import numpy as np
 import math

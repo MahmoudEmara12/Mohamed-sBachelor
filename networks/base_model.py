@@ -9,7 +9,7 @@ import json
 import pandas as pd
 import shutil
 
-# from tools.plot_time_frequency import TimeFrequencyFigData
+from tools.plot_time_frequency import TimeFrequencyFigData
 from datasets.datasets import Datasets
 
 class BaseModel(object):

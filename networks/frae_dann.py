@@ -1,16 +1,14 @@
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import numpy as np
 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from networks.base_model import BaseModel
 
 
 # =========================================================
-# GRADIENT REVERSAL
+# GRL (Gradient Reversal Layer)
 # =========================================================
 class GradReverse(torch.autograd.Function):
     @staticmethod
@@ -28,10 +26,10 @@ def grad_reverse(x, alpha=1.0):
 
 
 # =========================================================
-# MODEL
+# NETWORK COMPONENTS
 # =========================================================
 class Encoder(nn.Module):
-    def __init__(self, input_dim, latent_dim=32):
+    def __init__(self, input_dim, latent_dim):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, 256),
@@ -71,6 +69,9 @@ class DomainClassifier(nn.Module):
         return self.net(z)
 
 
+# =========================================================
+# FULL MODEL
+# =========================================================
 class FRAE_DANNNet(nn.Module):
     def __init__(self, input_dim, latent_dim=32):
         super().__init__()
@@ -89,12 +90,14 @@ class FRAE_DANNNet(nn.Module):
 
 
 # =========================================================
-# MAIN CLASS
+# MAIN WRAPPER
 # =========================================================
 class FRAE_DANN(BaseModel):
 
     def __init__(self, args, train=True, test=False):
         super().__init__(args=args, train=train, test=test)
+
+        self.latent_dim = 32
 
         self.optimizer = optim.AdamW(
             self.model.parameters(),
@@ -108,10 +111,10 @@ class FRAE_DANN(BaseModel):
             eta_min=args.learning_rate * 0.05
         )
 
-        # FIXED AMP (no warning)
+        # modern AMP (no warnings)
         self.scaler = torch.amp.GradScaler("cuda")
 
-        self.latent_dim = 32
+        # Mahalanobis stats (inference only)
         self.mean = None
         self.inv_cov = None
 
@@ -126,26 +129,30 @@ class FRAE_DANN(BaseModel):
     def train(self, epoch):
 
         self.model.train()
-        total_loss = 0
+        total_loss = 0.0
+
+        alpha = min(epoch / max(self.args.epochs, 1), 1.0)
 
         for batch in self.train_loader:
 
             x = batch[0].to(self.device).float()
 
-            self.optimizer.zero_grad()
-
-            alpha = min(epoch / max(self.args.epochs, 1), 1.0)
+            self.optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast("cuda"):
 
                 recon, z, dom = self.model(x, alpha)
 
-                # reconstruction
+                # reconstruction loss (core ASD objective)
                 recon_loss = F.mse_loss(recon, x)
 
-                # domain loss (safe fallback if labels exist)
+                # domain loss (only if labels exist; otherwise neutral)
                 if len(batch) > 2:
-                    domain_labels = torch.zeros(x.size(0), dtype=torch.long, device=self.device)
+                    domain_labels = torch.zeros(
+                        x.size(0),
+                        dtype=torch.long,
+                        device=self.device
+                    )
                     dom_loss = F.cross_entropy(dom, domain_labels)
                 else:
                     dom_loss = 0.0
@@ -163,7 +170,7 @@ class FRAE_DANN(BaseModel):
         print(f"[Epoch {epoch}] loss={total_loss / len(self.train_loader):.6f}")
 
     # -----------------------------------------------------
-    # MAHALANOBIS BUILD (CLEAN VERSION)
+    # MAHALANOBIS (POST-TRAIN ONLY)
     # -----------------------------------------------------
     def build_covariance(self):
 
@@ -191,7 +198,7 @@ class FRAE_DANN(BaseModel):
         self.mean = self.mean.to(self.device)
         self.inv_cov = self.inv_cov.to(self.device)
 
-        print("[INFO] Mahalanobis ready")
+        print("[INFO] Mahalanobis statistics built")
 
     # -----------------------------------------------------
     def test(self):
@@ -199,13 +206,13 @@ class FRAE_DANN(BaseModel):
         self.model.eval()
         self.build_covariance()
 
-        all_scores = []
+        scores = []
 
         with torch.no_grad():
             for batch in self.test_loader:
 
                 x = batch[0].to(self.device).float()
-                recon, z, _ = self.model(x)
+                _, z, _ = self.model(x)
 
                 diff = z - self.mean
 
@@ -214,7 +221,7 @@ class FRAE_DANN(BaseModel):
                     dim=1
                 )
 
-                all_scores.extend(score.cpu().numpy())
+                scores.extend(score.cpu().numpy())
 
-        print("[INFO] Test done")
-        return all_scores
+        print("[INFO] Testing complete")
+        return scores

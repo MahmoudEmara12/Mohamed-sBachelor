@@ -652,30 +652,44 @@ class FRAE_DANN(BaseModel):
                     all_names.extend(names)
 
         # Save scores
-        os.makedirs(
-            "results",
+        result_dir = (
+           self.result_dir
+           if self.args.dev
+           else self.eval_data_result_dir
+        )
+        result_dir.mkdir(
+            parents=True,
             exist_ok=True
+        )
+        save_path = result_dir /(
+            f"frae_all_scores_"
+            f"{self.args.dataset}_"
+            f"seed{self.args.seed}"
+            f"{self.model_name_suffix}"
+            f"{self.eval_suffix}.csv"
         )
 
         df = pd.DataFrame({
-            "anon": all_names,
+            "filename": all_names,
             "mse_score": all_mse,
             "mahal_score": all_mahal,
             "label": all_labels,
             "domain": all_domains
         })
+        save_path = "/kaggle/working/results/frae_all_scores.csv"
 
         df.to_csv(
-            "frae_all_scores.csv",
+            save_path,
             index=False
         )
+        print(f"Saved → {save_path}")
 
         print(
             "\n[OK] FRAE+DANN evaluation complete"
         )
 
         print(
-            "Saved → frae_all_scores.csv"
+            f"Saved → {save_path}"
         )
 
         print(

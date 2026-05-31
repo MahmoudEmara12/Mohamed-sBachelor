@@ -1,13 +1,69 @@
 import os
+import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import pandas as pd
 import numpy as np
+import scipy
 
+from sklearn import metrics
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from networks.base_model import BaseModel
+
+
+# =========================================================
+# SMALL HELPERS
+# =========================================================
+def _to_numpy(x):
+    if isinstance(x, torch.Tensor):
+        x = x.detach().cpu().numpy()
+    else:
+        x = np.asarray(x)
+    return x
+
+
+def _to_1d_int_array(x):
+    x = _to_numpy(x)
+
+    if x.ndim == 0:
+        return np.array([int(x)])
+
+    if x.ndim > 1:
+        # Handles one-hot labels/domains if they ever appear
+        if x.shape[-1] > 1:
+            x = np.argmax(x, axis=-1)
+        else:
+            x = np.squeeze(x, axis=-1)
+
+    return x.astype(int).reshape(-1)
+
+
+def _safe_roc_auc(y_true, y_score, max_fpr=None):
+    y_true = np.asarray(y_true).reshape(-1)
+    y_score = np.asarray(y_score).reshape(-1)
+
+    if len(y_true) == 0 or len(np.unique(y_true)) < 2:
+        return np.nan
+
+    try:
+        if max_fpr is None:
+            return metrics.roc_auc_score(y_true, y_score)
+        return metrics.roc_auc_score(y_true, y_score, max_fpr=max_fpr)
+    except Exception:
+        return np.nan
+
+
+def _safe_hmean(values):
+    values = np.asarray(values, dtype=float)
+    values = values[np.isfinite(values)]
+    values = values[values > 0]
+
+    if len(values) == 0:
+        return np.nan
+
+    return scipy.stats.hmean(np.maximum(values, sys.float_info.epsilon))
 
 
 # =========================================================
@@ -293,7 +349,9 @@ class FRAE_DANN(BaseModel):
             eta_min=args.learning_rate * 0.05
         )
 
-        self.scaler = torch.cuda.amp.GradScaler()
+        self.scaler = torch.cuda.amp.GradScaler(
+            enabled=torch.cuda.is_available()
+        )
 
         self.best_hmean = 0.0
         self.early_stop_patience = 20
@@ -358,7 +416,7 @@ class FRAE_DANN(BaseModel):
         total_loss = 0.0
 
         alpha = (
-            epoch / self.args.epochs
+            epoch / max(self.args.epochs, 1)
         ) ** 2
 
         for batch in self.train_loader:
@@ -392,11 +450,11 @@ class FRAE_DANN(BaseModel):
             x1 = x1.view(batch_size, -1)
             x2 = x2.view(batch_size, -1)
 
-            self.optimizer.zero_grad(
-                set_to_none=True
-            )
+            self.optimizer.zero_grad(set_to_none=True)
 
-            with torch.cuda.amp.autocast():
+            with torch.cuda.amp.autocast(
+                enabled=torch.cuda.is_available()
+            ):
 
                 recon1, z1, dom_logits1 = self.model(
                     x1,
@@ -452,6 +510,7 @@ class FRAE_DANN(BaseModel):
                 )
 
             self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
 
             torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(),
@@ -459,7 +518,6 @@ class FRAE_DANN(BaseModel):
             )
 
             self.scaler.step(self.optimizer)
-
             self.scaler.update()
 
             total_loss += loss.item()
@@ -474,6 +532,7 @@ class FRAE_DANN(BaseModel):
             f"[Epoch {epoch}] "
             f"loss={avg_loss:.5f}"
         )
+
         # Save model exactly like baseline
         torch.save(
             self.model.state_dict(),
@@ -489,7 +548,6 @@ class FRAE_DANN(BaseModel):
             },
             self.checkpoint_path
         )
-    
 
         return False
 
@@ -515,16 +573,9 @@ class FRAE_DANN(BaseModel):
 
                 # Domains
                 if len(batch) > 2:
-
-                    d = batch[2]
-
-                    if isinstance(d, torch.Tensor):
-                        d = d.cpu().numpy()
-                    else:
-                        d = np.zeros(z_cpu.size(0))
-
+                    d = _to_1d_int_array(batch[2])
                 else:
-                    d = np.zeros(z_cpu.size(0))
+                    d = np.zeros(z_cpu.size(0), dtype=int)
 
                 for i, dom in enumerate(d):
 
@@ -643,15 +694,15 @@ class FRAE_DANN(BaseModel):
                     )
 
                     y = (
-                        batch[1].cpu().numpy()
+                        _to_1d_int_array(batch[1])
                         if len(batch) > 1
-                        else np.zeros(x.size(0))
+                        else np.zeros(x.size(0), dtype=int)
                     )
 
                     d = (
-                        batch[2].cpu().numpy()
+                        _to_1d_int_array(batch[2])
                         if len(batch) > 2
-                        else np.zeros(x.size(0))
+                        else np.zeros(x.size(0), dtype=int)
                     )
 
                     names = (
@@ -663,21 +714,22 @@ class FRAE_DANN(BaseModel):
                         ]
                     )
 
-                    all_labels.extend(y)
-                    all_domains.extend(d)
+                    all_labels.extend(y.tolist())
+                    all_domains.extend(d.tolist())
                     all_names.extend(names)
 
         # Save scores
         result_dir = (
-           self.result_dir
-           if self.args.dev
-           else self.eval_data_result_dir
+            self.result_dir
+            if self.args.dev
+            else self.eval_data_result_dir
         )
         result_dir.mkdir(
             parents=True,
             exist_ok=True
         )
-        save_path = result_dir /(
+
+        save_path = result_dir / (
             f"frae_all_scores_"
             f"{self.args.dataset}_"
             f"seed{self.args.seed}"
@@ -692,18 +744,100 @@ class FRAE_DANN(BaseModel):
             "label": all_labels,
             "domain": all_domains
         })
-    
+
         df.to_csv(
             save_path,
             index=False
         )
 
+        # =====================================================
+        # METRICS: SOURCE / TARGET AUC, pAUC, HARMONIC MEAN
+        # =====================================================
+        y_true = np.asarray(all_labels, dtype=int)
+        y_pred = np.asarray(all_mahal, dtype=float)
+        domains = np.asarray(all_domains)
+
+        # Support either numeric domains or string domains
+        if domains.dtype.kind in {"U", "S", "O"}:
+            domains_str = np.array([str(x).lower() for x in domains])
+            source_mask = (domains_str == "source")
+            target_mask = (domains_str == "target")
+        else:
+            source_mask = (domains == 0)
+            target_mask = (domains == 1)
+
+        max_fpr = getattr(self.args, "max_fpr", 0.1)
+
+        # Source AUC / pAUC
+        y_true_s_auc = y_true[source_mask | (y_true == 1)]
+        y_pred_s_auc = y_pred[source_mask | (y_true == 1)]
+
+        auc_s = _safe_roc_auc(y_true_s_auc, y_pred_s_auc)
+        p_auc_s = _safe_roc_auc(
+            y_true[source_mask],
+            y_pred[source_mask],
+            max_fpr=max_fpr
+        )
+
+        # Target AUC / pAUC
+        y_true_t_auc = y_true[target_mask | (y_true == 1)]
+        y_pred_t_auc = y_pred[target_mask | (y_true == 1)]
+
+        auc_t = _safe_roc_auc(y_true_t_auc, y_pred_t_auc)
+        p_auc_t = _safe_roc_auc(
+            y_true[target_mask],
+            y_pred[target_mask],
+            max_fpr=max_fpr
+        )
+
+        # Overall pAUC
+        p_auc = _safe_roc_auc(
+            y_true,
+            y_pred,
+            max_fpr=max_fpr
+        )
+
+        # Means over available metrics
+        perf_values = np.array(
+            [auc_s, auc_t, p_auc, p_auc_s, p_auc_t],
+            dtype=float
+        )
+        perf_values = perf_values[np.isfinite(perf_values)]
+
+        arithmetic_mean = (
+            float(np.mean(perf_values))
+            if len(perf_values) > 0
+            else np.nan
+        )
+        harmonic_mean = _safe_hmean(perf_values)
+
         print(
             "\n[OK] FRAE+DANN evaluation complete"
         )
-
         print(
             f"Saved → {save_path}"
+        )
+
+        print(
+            f"AUC (source): {auc_s:.6f}"
+        )
+        print(
+            f"pAUC (source): {p_auc_s:.6f}"
+        )
+        print(
+            f"AUC (target): {auc_t:.6f}"
+        )
+        print(
+            f"pAUC (target): {p_auc_t:.6f}"
+        )
+        print(
+            f"pAUC (all): {p_auc:.6f}"
+        )
+        print(
+            f"Arithmetic mean: {arithmetic_mean:.6f}"
+        )
+        print(
+            f"Harmonic mean: {harmonic_mean:.6f}"
         )
 
         print(
@@ -719,3 +853,14 @@ class FRAE_DANN(BaseModel):
             f"→ "
             f"{max(all_mahal):.6f}"
         )
+
+        return {
+            "save_path": str(save_path),
+            "auc_source": auc_s,
+            "auc_target": auc_t,
+            "pauc_all": p_auc,
+            "pauc_source": p_auc_s,
+            "pauc_target": p_auc_t,
+            "arithmetic_mean": arithmetic_mean,
+            "harmonic_mean": harmonic_mean,
+        }

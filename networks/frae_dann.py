@@ -474,6 +474,22 @@ class FRAE_DANN(BaseModel):
             f"[Epoch {epoch}] "
             f"loss={avg_loss:.5f}"
         )
+        # Save model exactly like baseline
+        torch.save(
+            self.model.state_dict(),
+            self.model_path
+        )
+
+        torch.save(
+            {
+                "epoch": epoch,
+                "model_state_dict": self.model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "loss": avg_loss
+            },
+            self.checkpoint_path
+        )
+    
 
         return False
 
@@ -676,13 +692,11 @@ class FRAE_DANN(BaseModel):
             "label": all_labels,
             "domain": all_domains
         })
-        save_path = "/kaggle/working/results/frae_all_scores.csv"
-
+    
         df.to_csv(
             save_path,
             index=False
         )
-        print(f"Saved → {save_path}")
 
         print(
             "\n[OK] FRAE+DANN evaluation complete"

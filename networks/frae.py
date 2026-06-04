@@ -35,6 +35,8 @@ class ResBlock(nn.Module):
         x = self.fc2(x)
         x = self.norm2(x)
 
+        x = torch.clamp(x, -3, 3)
+
         return x + residual
 
 
@@ -172,12 +174,17 @@ def augment(x, frames, n_mels):
 
     scale = torch.empty(x2.size(0), 1, device=x.device).uniform_(0.85, 1.15)
     x2 = x2 * scale
+    x2 = torch.clamp(x2, -5, 5)
 
     x2 = x2 + torch.randn_like(x2) * 0.01  # ↓ reduce noise
 
     x2 = torch.nan_to_num(x2, nan=0.0, posinf=1.0, neginf=-1.0)
 
     return x2
+def safe_input(x):
+    x = torch.nan_to_num(x, nan=0.0, posinf=1.0, neginf=-1.0)
+    return torch.clamp(x, -5, 5)
+    
 
 
 # =========================================================
@@ -383,10 +390,12 @@ class FRAEV4(DCASE2023T2AE):
                     else:
                         recon_loss_target = 0
 
-                    # FRAE v4 objective: reconstruction + VICReg regularization
-                    x1 = augment(data, self.args.frames, self.args.n_mels)
-                    x2 = augment(data, self.args.frames, self.args.n_mels)
+                    x1 = safe_input(augment(data, self.args.frames, self.args.n_mels))
+                    x2 = safe_input(augment(data, self.args.frames, self.args.n_mels))
 
+
+                    x1 = safe_input(x1)
+                    x2 = safe_input(x2)
                     recon1, z1 = self.model(x1)
                     _, z2 = self.model(x2)
                     z1 = torch.nan_to_num(z1, nan=0.0, posinf=1.0, neginf=-1.0)

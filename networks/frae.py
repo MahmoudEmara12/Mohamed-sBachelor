@@ -284,7 +284,7 @@ class FRAEV4(DCASE2023T2AE):
             n_loss=num,
         )
 
-        y_pred.append(min(loss_target.item(), loss_source.item()))
+        y_pred.append(0.5 * (loss_source.item() + loss_target.item()))
         return y_pred
 
     # =====================================================
@@ -424,8 +424,7 @@ class FRAEV4(DCASE2023T2AE):
                     train_obj = (
                         recon_loss +
                         vic_weight * vic_loss +
-                        0.0002 * latent_penalty + 
-                        0.05 * domain_loss
+                        0.0002 * latent_penalty
                     )
 
                 self.loss = recon_loss

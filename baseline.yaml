@@ -2,7 +2,7 @@
 --result_directory: ./results
 --export_dir: baseline
 
---use_cuda: True
+--use_cuda: FALSE
 --log_interval: 100
 ##--model: DCASE2023T2-AE FRAME CNN
 --model: FRAE

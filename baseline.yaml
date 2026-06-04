@@ -5,7 +5,7 @@
 --use_cuda: True
 --log_interval: 100
 ##--model: DCASE2023T2-AE FRAME CNN
---model: FRAE
+--model: DCASE2023T2-AE
 --score: MAHALA
 --seed: 13711
 --is_auto_download: False
@@ -26,7 +26,7 @@
 
 # fit
 --batch_size: 256
---epochs: 40
+--epochs: 100
 -lr: 0.001
 --shuffle: True
 --validation_split: 0.1

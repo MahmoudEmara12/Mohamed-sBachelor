@@ -284,7 +284,7 @@ class FRAEV4(DCASE2023T2AE):
             n_loss=num,
         )
 
-        y_pred.append(min(loss_target.item(), loss_source.item()))
+        y_pred.append(loss_source.item())
         return y_pred
 
     # =====================================================
@@ -409,7 +409,7 @@ class FRAEV4(DCASE2023T2AE):
                         epoch / max(getattr(self.args, "epochs", 50), 1),
                         1.0
                     )
-                    vic_weight = 0.0 if epoch < 3 else 0.02 * progress
+                    vic_weight = 0.0 if epoch < 5 else 0.005 * progress
 
                     train_obj = (
                         recon_loss +

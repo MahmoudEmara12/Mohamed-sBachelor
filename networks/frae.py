@@ -12,6 +12,9 @@ from networks.criterion.mahala import cov_v, loss_function_mahala, calc_inv_cov
 from tools.plot_loss_curve import csv_to_figdata
 
 
+# =========================================================
+# RESIDUAL BLOCK
+# =========================================================
 class ResBlock(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -37,6 +40,9 @@ class ResBlock(nn.Module):
         return x + residual
 
 
+# =========================================================
+# ENCODER
+# =========================================================
 class Encoder(nn.Module):
 
     def __init__(self, input_dim, hidden=256, latent_dim=16):
@@ -56,6 +62,9 @@ class Encoder(nn.Module):
         return self.net(x)
 
 
+# =========================================================
+# DECODER
+# =========================================================
 class Decoder(nn.Module):
 
     def __init__(self, latent_dim, hidden, output_dim):
@@ -74,6 +83,9 @@ class Decoder(nn.Module):
         return self.net(z)
 
 
+# =========================================================
+# CORE NETWORK
+# =========================================================
 class FRAENetV4(nn.Module):
 
     def __init__(self, input_dim, block_size, frames, n_mels, latent_dim=16):
@@ -98,6 +110,7 @@ class FRAENetV4(nn.Module):
 
         self.freq_weights = nn.Parameter(torch.linspace(0.8, 1.5, n_mels))
 
+        # Required by the repo's Mahalanobis utilities
         self.register_buffer("cov_source", torch.eye(block_size))
         self.register_buffer("cov_target", torch.eye(block_size))
 
@@ -119,6 +132,9 @@ class FRAENetV4(nn.Module):
         return (sq_err * w).sum(dim=-1).mean()
 
 
+# =========================================================
+# VICREG LOSS
+# =========================================================
 def vicreg_loss(z1, z2):
 
     inv_loss = F.mse_loss(z1, z2)
@@ -150,6 +166,9 @@ def vicreg_loss(z1, z2):
     )
 
 
+# =========================================================
+# AUGMENTATION
+# =========================================================
 def augment(x, frames, n_mels):
     x2 = x.clone()
 
@@ -157,7 +176,7 @@ def augment(x, frames, n_mels):
     x2 = x2 * scale
     x2 = torch.clamp(x2, -5, 5)
 
-    x2 = x2 + torch.randn_like(x2) * 0.01  
+    x2 = x2 + torch.randn_like(x2) * 0.01  # ↓ reduce noise
 
     x2 = torch.nan_to_num(x2, nan=0.0, posinf=1.0, neginf=-1.0)
 
@@ -168,7 +187,9 @@ def safe_input(x):
     
 
 
-
+# =========================================================
+# FRAE V4
+# =========================================================
 class FRAEV4(DCASE2023T2AE):
 
     def __init__(self, args, train=True, test=False):
@@ -190,7 +211,9 @@ class FRAEV4(DCASE2023T2AE):
         self.use_amp = bool(torch.cuda.is_available() and self.device.type == "cuda")
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-   
+    # =====================================================
+    # INIT MODEL
+    # =====================================================
     def init_model(self):
         self.block_size = self.data.height
         print(f"[INFO] latent_dim = {getattr(self.args, 'latent_dim', 16)}")
@@ -261,10 +284,13 @@ class FRAEV4(DCASE2023T2AE):
             n_loss=num,
         )
 
-        y_pred.append(loss_target.item())
+        y_pred.append(min(loss_target.item(), loss_source.item()))
         return y_pred
 
-    
+    # =====================================================
+    # TRAIN
+    # Baseline protocol + FRAE v4 objective
+    # =====================================================
     def train(self, epoch):
         if epoch <= self.epoch:
             return
@@ -279,7 +305,7 @@ class FRAEV4(DCASE2023T2AE):
 
         train_loader = self.train_loader
 
-        if epoch == self.args.epochs + 1:
+        if epoch == self.args.epochs + 3:
             print("\n============== CALCULATE COVARIANCE ==============")
             is_calc_cov = True
             self.model.eval()
@@ -345,7 +371,7 @@ class FRAEV4(DCASE2023T2AE):
                 with torch.cuda.amp.autocast(enabled=self.use_amp):
                     recon_batch, _ = self.model(data)
 
-                   
+                    # Baseline-style score for logging / distribution fitting
                     score_2d = self.loss_fn(recon_batch, data)
 
                     n_loss = len(score_2d)
@@ -367,25 +393,40 @@ class FRAEV4(DCASE2023T2AE):
                     x1 = safe_input(augment(data, self.args.frames, self.args.n_mels))
                     x2 = safe_input(augment(data, self.args.frames, self.args.n_mels))
 
-
-                    x1 = safe_input(x1)
-                    x2 = safe_input(x2)
-                    recon1, z1 = self.model(x1)
-                    _, z2 = self.model(x2)
+                    z1 = self.model.encoder(x1)
+                    z2 = self.model.encoder(x2)
                     z1 = torch.nan_to_num(z1, nan=0.0, posinf=1.0, neginf=-1.0)
                     z2 = torch.nan_to_num(z2, nan=0.0, posinf=1.0, neginf=-1.0)
+                    
 
                     vic_loss = vicreg_loss(z1.float(), z2.float())
                     latent_penalty = torch.mean(torch.abs(torch.clamp(z1, -5, 5)))
                     latent_penalty = 1e-5 * latent_penalty
 
+                    if n_source > 0 and n_target > 0:
+                        x_source = data[is_source_list]
+                        x_target = data[is_target_list]
+                        z_source = self.model.encoder(x_source)
+                        z_target = self.model.encoder(x_target)
+                        domain_loss = F.mse_loss(
+                            z_source.mean(dim=0),
+                             z_target.mean(dim=0)
+                        )
+                    else:
+                        domain_loss = 0.0
+
                     progress = min(
                         epoch / max(getattr(self.args, "epochs", 50), 1),
                         1.0
                     )
-                    vic_weight = 0.0 if epoch < 5 else 0.005 * progress
+                    vic_weight = 0.0 if epoch < 3 else 0.002 * progress
 
-                    train_obj = recon_loss
+                    train_obj = (
+                        recon_loss +
+                        vic_weight * vic_loss +
+                        0.0002 * latent_penalty + 
+                        0.05 * domain_loss
+                    )
 
                 self.loss = recon_loss
 
@@ -419,7 +460,7 @@ class FRAEV4(DCASE2023T2AE):
                     )
                 continue
 
-           
+            # covariance pass bookkeeping
             n_loss = len(score_2d)
             score = self.loss_reduction_1d(score=score_2d)
 
@@ -481,6 +522,7 @@ class FRAEV4(DCASE2023T2AE):
                 score_distr_file_path=self.mahala_score_distr_file_path,
             )
 
+        # validation test
         val_loss = 0
         with torch.no_grad():
             self.model.eval()
@@ -532,6 +574,7 @@ class FRAEV4(DCASE2023T2AE):
                 score_distr_file_path=self.mse_score_distr_file_path,
             )
 
+        # save model
         torch.save(self.model.state_dict(), self.model_path)
         torch.save(
             {
@@ -544,6 +587,7 @@ class FRAEV4(DCASE2023T2AE):
         )
 
 
+# aliases
 FRAE = FRAEV4
 FRAEV2 = FRAEV4
 FRAEV3 = FRAEV4

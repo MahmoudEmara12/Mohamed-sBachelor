@@ -134,9 +134,9 @@ class FRAENetV4(nn.Module):
 def vicreg_loss(z1, z2):
 
     inv_loss = F.mse_loss(z1, z2)
-
-    std_z1 = torch.sqrt(z1.var(dim=0) + 1e-4)
-    std_z2 = torch.sqrt(z2.var(dim=0) + 1e-4)
+    eps = 1e-4
+    std_z1 = torch.sqrt(z1.var(dim=0, unbiased=False) + eps)
+    std_z2 = torch.sqrt(z2.var(dim=0, unbiased=False) + eps)
 
     var_loss = (
         F.relu(1.0 - std_z1).mean() +
@@ -394,15 +394,15 @@ class FRAEV4(DCASE2023T2AE):
                     recon1, z1 = self.model(x1)
                     _, z2 = self.model(x2)
 
-                    vic_loss = vicreg_loss(z1, z2)
-                    latent_penalty = torch.mean(torch.abs(z1))
-                    latent_penalty = 0.00002 * latent_penalty
+                    vic_loss = vicreg_loss(z1.float(), z2.float())
+                    latent_penalty = torch.mean(torch.abs(torch.clamp(z1, -5, 5)))
+                    latent_penalty = 1e-5 * latent_penalty
 
                     progress = min(
                         epoch / max(getattr(self.args, "epochs", 50), 1),
                         1.0
                     )
-                    vic_weight = 0.03 * progress
+                    vic_weight = 0.0 if epoch < 3 else 0.02 * progress
 
                     train_obj = (
                         recon_loss +

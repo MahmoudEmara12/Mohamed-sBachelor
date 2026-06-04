@@ -1,51 +1,15 @@
-"""
-FRAE v4 — Fast Frequency-aware Reconstruction Autoencoder
-Optimised for:
-  - Faster training/testing
-  - Better Mahalanobis stability
-  - Stronger reconstruction quality
-  - Lower runtime (~2-4x faster than v3)
-
-CHANGES FROM V3:
-  1. Removed:
-       - GMM scoring
-       - band_ensemble
-       - combined_score
-     because they were not improving performance.
-
-  2. Kept ONLY:
-       - mse_score
-       - mahal_score
-
-  3. Faster architecture:
-       - latent_dim reduced: 128 -> 64
-       - hidden dims reduced
-       - removed unnecessary decoder heads
-
-  4. Faster training:
-       - mixed precision (AMP)
-       - non_blocking GPU transfer
-       - torch.inference_mode() in testing
-       - faster covariance build
-
-  5. Better Mahalanobis:
-       - shrinkage covariance
-       - latent standardisation
-       - stronger VICReg weighting
-
-  6. Lower memory usage
-"""
-
-import os
-import pickle
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import pandas as pd
+
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from networks.base_model import BaseModel
+from tqdm import tqdm
+
+from networks.dcase2023t2_ae.dcase2023t2_ae import DCASE2023T2AE
+from networks.criterion.mahala import cov_v, loss_function_mahala, calc_inv_cov
+from tools.plot_loss_curve import csv_to_figdata
 
 
 # =========================================================
@@ -122,7 +86,7 @@ class Decoder(nn.Module):
 # =========================================================
 class FRAENetV4(nn.Module):
 
-    def __init__(self, input_dim, frames, n_mels, latent_dim=16):
+    def __init__(self, input_dim, block_size, frames, n_mels, latent_dim=16):
         super().__init__()
 
         self.frames = frames
@@ -142,28 +106,18 @@ class FRAENetV4(nn.Module):
             output_dim=input_dim,
         )
 
-        weights = torch.linspace(0.8, 1.5, n_mels)
-        self.freq_weights = nn.Parameter(weights)
+        self.freq_weights = nn.Parameter(torch.linspace(0.8, 1.5, n_mels))
 
-    # =====================================================
-    # FORWARD
-    # =====================================================
+        # Required by the repo's Mahalanobis utilities
+        self.register_buffer("cov_source", torch.eye(block_size))
+        self.register_buffer("cov_target", torch.eye(block_size))
+
     def forward(self, x):
-
         z = self.encoder(x)
-
-        # L2 latent normalisation
-        
-
         recon = self.decoder(z)
-
         return recon, z
 
-    # =====================================================
-    # FREQUENCY-WEIGHTED MSE
-    # =====================================================
     def freq_weighted_mse(self, x, recon):
-
         x_2d = x.view(x.size(0), self.frames, self.n_mels)
         r_2d = recon.view(recon.size(0), self.frames, self.n_mels)
 
@@ -171,7 +125,6 @@ class FRAENetV4(nn.Module):
         w = w.unsqueeze(0).unsqueeze(0)
 
         sq_err = (x_2d - r_2d) ** 2
-
         return (sq_err * w).sum(dim=-1).mean()
 
 
@@ -191,13 +144,13 @@ def vicreg_loss(z1, z2):
     )
 
     def covariance_loss(z):
+        if z.size(0) < 2:
+            return torch.tensor(0.0, device=z.device)
 
         z = z - z.mean(dim=0)
-
         cov = (z.T @ z) / (z.size(0) - 1)
 
-        off_diag = cov.flatten()[:-1].view(cov.size(0) - 1, cov.size(1) + 1)[:, 1:].flatten()
-
+        off_diag = cov - torch.diag(torch.diagonal(cov))
         return (off_diag ** 2).mean()
 
     cov_loss = covariance_loss(z1) + covariance_loss(z2)
@@ -216,14 +169,11 @@ def augment(x, frames, n_mels):
 
     x2 = x.clone()
 
-    # amplitude scaling
     scale = torch.empty(x2.size(0), 1, device=x.device).uniform_(0.85, 1.15)
     x2 = x2 * scale
 
-    # gaussian noise
     x2 = x2 + torch.randn_like(x2) * 0.03
 
-    # small frequency shift
     roll = np.random.randint(-1, 2)
 
     if roll != 0:
@@ -237,7 +187,7 @@ def augment(x, frames, n_mels):
 # =========================================================
 # FRAE V4
 # =========================================================
-class FRAEV4(BaseModel):
+class FRAEV4(DCASE2023T2AE):
 
     def __init__(self, args, train=True, test=False):
 
@@ -255,275 +205,371 @@ class FRAEV4(BaseModel):
             eta_min=self.args.learning_rate * 0.05,
         )
 
-        self.scaler = torch.cuda.amp.GradScaler()
-
-        self.mean = None
-        self.inv_cov = None
+        self.use_amp = bool(torch.cuda.is_available() and self.device.type == "cuda")
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
     # =====================================================
     # INIT MODEL
     # =====================================================
     def init_model(self):
+        self.block_size = self.data.height
         print(f"[INFO] latent_dim = {getattr(self.args, 'latent_dim', 16)}")
+
         return FRAENetV4(
             input_dim=self.data.input_dim,
+            block_size=self.block_size,
             frames=self.args.frames,
             n_mels=self.args.n_mels,
             latent_dim=getattr(self.args, "latent_dim", 16),
         )
-    
+
+    def get_log_header(self):
+        self.column_heading_list = [
+            ["loss"],
+            ["val_loss"],
+            ["recon_loss"],
+            ["recon_loss_source", "recon_loss_target"],
+        ]
+        return "loss,val_loss,recon_loss,recon_loss_source,recon_loss_target"
+
+    def loss_reduction_1d(self, score):
+        return torch.mean(score, dim=1)
+
+    def loss_reduction(self, score, n_loss):
+        return torch.sum(score) / n_loss
+
+    def loss_fn(self, recon_x, x):
+        """
+        Frequency-weighted MSE.
+        Returns unreduced tensor with shape (B, D).
+        """
+        x_2d = x.view(x.size(0), self.args.frames, self.args.n_mels)
+        recon_2d = recon_x.view(recon_x.size(0), self.args.frames, self.args.n_mels)
+
+        weights = F.softmax(self.model.freq_weights, dim=0)
+        loss = ((x_2d - recon_2d) ** 2) * weights.unsqueeze(0).unsqueeze(0)
+
+        return loss.view(loss.size(0), -1)
+
+    def calc_valid_mahala_score(self, data, y_pred, inv_cov_source, inv_cov_target):
+        data = data.to(self.device).float()
+        recon_data, _ = self.model(data)
+
+        loss_source, num = loss_function_mahala(
+            recon_x=recon_data,
+            x=data,
+            block_size=self.block_size,
+            cov=inv_cov_source,
+            use_precision=True,
+            reduction=False,
+        )
+        loss_source = self.loss_reduction(
+            score=self.loss_reduction_1d(loss_source),
+            n_loss=num,
+        )
+
+        loss_target, num = loss_function_mahala(
+            recon_x=recon_data,
+            x=data,
+            block_size=self.block_size,
+            cov=inv_cov_target,
+            use_precision=True,
+            reduction=False,
+        )
+        loss_target = self.loss_reduction(
+            score=self.loss_reduction_1d(loss_target),
+            n_loss=num,
+        )
+
+        y_pred.append(min(loss_target.item(), loss_source.item()))
+        return y_pred
+
     # =====================================================
     # TRAIN
+    # Baseline protocol + FRAE v4 objective
     # =====================================================
     def train(self, epoch):
+        if epoch <= self.epoch:
+            return
 
-        self.model.train()
+        torch.autograd.set_detect_anomaly(True)
 
-        total_loss = 0.0
+        train_loss = 0
+        train_recon_loss = 0
+        train_recon_loss_source = 0
+        train_recon_loss_target = 0
+        y_pred = []
 
-        for batch in self.train_loader:
+        train_loader = self.train_loader
 
-            x = batch[0].to(self.device, non_blocking=True).float()
+        if epoch == self.args.epochs + 1:
+            print("\n============== CALCULATE COVARIANCE ==============")
+            is_calc_cov = True
+            self.model.eval()
 
-            x1 = augment(x, self.args.frames, self.args.n_mels)
-            x2 = augment(x, self.args.frames, self.args.n_mels)
+            cov_x_source = torch.zeros(
+                (self.block_size, self.block_size),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            cov_x_target = cov_x_source.clone().detach()
+            num_source = 0
+            num_target = 0
+            epoch = self.args.epochs
+        else:
+            self.model.train()
+            is_calc_cov = False
 
-            self.optimizer.zero_grad(set_to_none=True)
+        for batch_idx, batch in enumerate(tqdm(train_loader)):
+            data = batch[0].to(self.device).float()
 
-            with torch.cuda.amp.autocast():
+            if data.shape[0] <= 1:
+                continue
 
-                recon1, z1 = self.model(x1)
-                _, z2 = self.model(x2)
+            data_name_list = batch[3]
+            is_target_list = ["target" in data_name for data_name in data_name_list]
+            is_source_list = np.logical_not(is_target_list).tolist()
+            n_source = is_source_list.count(True)
+            n_target = is_target_list.count(True)
 
-                recon_loss = self.model.freq_weighted_mse(x, recon1)
+            if not is_calc_cov:
+                self.optimizer.zero_grad(set_to_none=True)
 
-                vic_loss = vicreg_loss(z1, z2)
+            if is_calc_cov:
+                with torch.no_grad():
+                    recon_batch, _ = self.model(data)
 
-                latent_loss = torch.mean(torch.abs(z1))
-                latent_loss=0.00002 * latent_loss
+                    score_2d, cov_diff_source, cov_diff_target = loss_function_mahala(
+                        recon_x=recon_batch,
+                        x=data,
+                        block_size=self.block_size,
+                        update_cov=True,
+                        reduction=False,
+                        is_source_list=is_source_list,
+                        is_target_list=is_target_list,
+                    )
 
-                progress = min(
-                    epoch / max(getattr(self.args, "epochs", 50), 1),
-                    1.0
+                    cov_x_source_batch = cov_v(
+                        diff=cov_diff_source,
+                        num=1,
+                    )
+                    cov_x_source += cov_x_source_batch.clone().detach()
+                    num_source += n_source
+
+                    if n_target > 0:
+                        cov_x_target_batch = cov_v(
+                            diff=cov_diff_target,
+                            num=1,
+                        )
+                        cov_x_target += cov_x_target_batch.clone().detach()
+                        num_target += n_target
+
+            else:
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    recon_batch, _ = self.model(data)
+
+                    # Baseline-style score for logging / distribution fitting
+                    score_2d = self.loss_fn(recon_batch, data)
+
+                    n_loss = len(score_2d)
+                    score = self.loss_reduction_1d(score=score_2d)
+
+                    recon_loss = self.loss_reduction(score=score, n_loss=n_loss)
+                    recon_loss_source = self.loss_reduction(
+                        score=score[is_source_list],
+                        n_loss=n_source,
+                    )
+                    if n_target > 0:
+                        recon_loss_target = self.loss_reduction(
+                            score=score[is_target_list],
+                            n_loss=n_target,
+                        )
+                    else:
+                        recon_loss_target = 0
+
+                    # FRAE v4 objective: reconstruction + VICReg regularization
+                    x1 = augment(data, self.args.frames, self.args.n_mels)
+                    x2 = augment(data, self.args.frames, self.args.n_mels)
+
+                    recon1, z1 = self.model(x1)
+                    _, z2 = self.model(x2)
+
+                    vic_loss = vicreg_loss(z1, z2)
+                    latent_penalty = torch.mean(torch.abs(z1))
+                    latent_penalty = 0.00002 * latent_penalty
+
+                    progress = min(
+                        epoch / max(getattr(self.args, "epochs", 50), 1),
+                        1.0
+                    )
+                    vic_weight = 0.03 * progress
+
+                    train_obj = (
+                        recon_loss +
+                        vic_weight * vic_loss +
+                        0.0002 * latent_penalty
+                    )
+
+                self.loss = recon_loss
+
+                self.scaler.scale(train_obj).backward()
+                self.scaler.unscale_(self.optimizer)
+
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    max_norm=5.0,
                 )
 
-                vic_weight = 0.03 * progress
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
 
-                loss = (
-                    recon_loss +
-                    vic_weight * vic_loss +
-                    0.0002 * latent_loss
+                train_loss += float(self.loss)
+                train_recon_loss += float(recon_loss)
+                train_recon_loss_source += float(recon_loss_source)
+                train_recon_loss_target += float(recon_loss_target)
+
+                y_pred.append(self.loss.item())
+
+                if batch_idx % self.args.log_interval == 0:
+                    print(
+                        "Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}".format(
+                            epoch,
+                            batch_idx * len(data),
+                            len(train_loader.dataset),
+                            100. * batch_idx / len(train_loader),
+                            self.loss.item()
+                        )
+                    )
+                continue
+
+            # covariance pass bookkeeping
+            n_loss = len(score_2d)
+            score = self.loss_reduction_1d(score=score_2d)
+
+            recon_loss = self.loss_reduction(score=score, n_loss=n_loss)
+            recon_loss_source = self.loss_reduction(
+                score=score[is_source_list],
+                n_loss=n_source,
+            )
+            if n_target > 0:
+                recon_loss_target = self.loss_reduction(
+                    score=score[is_target_list],
+                    n_loss=n_target,
                 )
+            else:
+                recon_loss_target = 0
 
-            self.scaler.scale(loss).backward()
+            self.loss = recon_loss
 
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(),
-                max_norm=5.0
+            train_loss += float(self.loss)
+            train_recon_loss += float(recon_loss)
+            train_recon_loss_source += float(recon_loss_source)
+            train_recon_loss_target += float(recon_loss_target)
+
+            y_pred.append(self.loss.item())
+
+        if is_calc_cov:
+            cov_x_source /= max(num_source - 1, 1)
+            if num_target == 0:
+                cov_x_target = cov_x_source.clone().detach()
+            else:
+                cov_x_target /= max(num_target - 1, 1)
+
+            self.model.cov_source.data = cov_x_source
+            self.model.cov_target.data = cov_x_target
+
+            inv_cov_source, inv_cov_target = calc_inv_cov(
+                model=self.model,
+                device=self.device,
             )
 
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-
-            total_loss += loss.item()
-
-        self.scheduler.step()
-
-        os.makedirs(os.path.dirname(self.model_path), exist_ok=True)
-
-        torch.save(self.model.state_dict(), self.model_path)
-
-        print(
-            f"[Epoch {epoch}] "
-            f"loss={total_loss / len(self.train_loader):.5f} "
-            f"lr={self.optimizer.param_groups[0]['lr']:.6f}"
-        )
-
-    # =====================================================
-    # BUILD MAHALANOBIS
-    # =====================================================
-    def build_covariance(self):
-
-        self.model.eval()
-
-        feats = []
-
-        with torch.inference_mode():
-
-            for batch in self.train_loader:
-
-                x = batch[0].to(
-                    self.device,
-                    non_blocking=True
-                ).float()
-
-                _, z = self.model(x)
-
-                feats.append(z.cpu())
-
-        feats = torch.cat(feats, dim=0)
-
-        # standardise latent space
-        self.mean = feats.mean(dim=0)
-
-        centered = feats - self.mean
-
-        cov = (centered.T @ centered) / (centered.size(0) - 1)
-
-        # shrinkage improves stability
-        shrinkage = 0.05
-
-        eye = torch.eye(cov.size(0))
-
-        cov = (
-            (1 - shrinkage) * cov +
-            shrinkage * eye
-        )
-
-        self.inv_cov = torch.linalg.pinv(cov)
-
-        self.mean = self.mean.to(self.device)
-        self.inv_cov = self.inv_cov.to(self.device)
-
-        print("[INFO] Mahalanobis covariance built")
-
-    # =====================================================
-    # TEST
-    # =====================================================
-    def test(self):
-
-        self.model.eval()
-
-        device = self.device
-
-        state = torch.load(
-            self.model_path,
-            map_location="cpu",
-            weights_only=False
-        )
-
-        self.model.load_state_dict(state)
-
-        self.model.to(device)
-
-        self.build_covariance()
-
-        all_mse = []
-        all_mahal = []
-        all_labels = []
-        all_domains = []
-        all_filenames = []
-
-        with torch.inference_mode():
-
-            for idx, section_loader in enumerate(self.test_loader):
-
-                for batch in section_loader:
-
-                    x = batch[0].to(
-                        device,
-                        non_blocking=True
-                    ).float()
-
-                    filenames = (
-                        batch[3]
-                        if len(batch) > 3
-                        else [f"sample_{i}" for i in range(x.size(0))]
-                    )
-
-                    y = (
-                        batch[1].cpu().numpy()
-                        if len(batch) > 1
-                        else np.zeros(x.size(0))
-                    )
-
-                    d = (
-                        batch[2].cpu().numpy()
-                        if len(batch) > 2
-                        else np.zeros(x.size(0))
-                    )
-
-                    recon, z = self.model(x)
-
-                    # =====================================
-                    # MSE SCORE
-                    # =====================================
-                
-
-                    x_2d = x.view(
-                        x.size(0),
-                        self.args.frames,
-                        self.args.n_mels
-                    )
-
-                    r_2d = recon.view( 
-                        recon.size(0),
-                        self.args.frames,
-                        self.args.n_mels
-                    )
-
-                    w = F.softmax(
-                        self.model.freq_weights,
-                        dim=0
-                    )
-
-                    w = w.unsqueeze(0).unsqueeze(0)
-
-                    mse = (
-                        ((x_2d - r_2d) ** 2) * w
-                    ).sum(dim=-1).mean(dim=-1)
-                    
-
-                    # =====================================
-                    # MAHALANOBIS SCORE
-                    # =====================================
-                    diff = z - self.mean
-
-                    mahal = torch.sum(
-                        torch.matmul(diff, self.inv_cov) * diff,
-                        dim=1
-                    )
-
-                    all_mse.extend(mse.cpu().numpy())
-                    all_mahal.extend(mahal.cpu().numpy())
-
-                    all_labels.extend(y)
-                    all_domains.extend(d)
-                    all_filenames.extend(filenames)
-
-                print(
-                    f"[Section {idx}] "
-                    f"samples={len(all_mse)}"
+            y_pred_mahala = []
+            for _, batch in enumerate(tqdm(train_loader)):
+                y_pred_mahala = self.calc_valid_mahala_score(
+                    data=batch[0],
+                    y_pred=y_pred_mahala,
+                    inv_cov_source=inv_cov_source,
+                    inv_cov_target=inv_cov_target,
+                )
+            for _, batch in enumerate(self.valid_loader):
+                y_pred_mahala = self.calc_valid_mahala_score(
+                    data=batch[0],
+                    y_pred=y_pred_mahala,
+                    inv_cov_source=inv_cov_source,
+                    inv_cov_target=inv_cov_target,
                 )
 
-        # =================================================
-        # SAVE
-        # =================================================
-        os.makedirs("results", exist_ok=True)
+            self.fit_anomaly_score_distribution(
+                y_pred=y_pred_mahala,
+                score_distr_file_path=self.mahala_score_distr_file_path,
+            )
 
-        df = pd.DataFrame({
-            "anon": all_filenames,
-            "mse_score": all_mse,
-            "mahal_score": all_mahal,
-            "label": all_labels,
-            "domain": all_domains,
-        })
+        # validation test
+        val_loss = 0
+        with torch.no_grad():
+            self.model.eval()
+            for _, batch in enumerate(self.valid_loader):
+                data = batch[0].to(self.device).float()
 
-        df.to_csv("frae_all_scores.csv", index=False)
+                recon_batch, _ = self.model(data)
+                score = self.loss_fn(
+                    recon_batch,
+                    data
+                )
+                loss = score.mean()
 
-        print("\n[OK] FRAE v4 evaluation complete")
-        print("Saved → frae_all_scores.csv")
-        print(
-            f"MSE range: {mse.min().item():.6f} -> {mse.max().item():.6f}"
+                val_loss += float(loss)
+                y_pred.append(loss.item())
+
+        if not is_calc_cov:
+            print(
+                '====> Epoch: {} Average loss: {:.4f} Validation loss: {:.4f}'.format(
+                    epoch,
+                    train_loss / len(train_loader),
+                    val_loss / len(self.valid_loader),
+                )
+            )
+
+            with open(self.log_path, 'a') as log:
+                np.savetxt(
+                    log,
+                    ["{0},{1},{2},{3},{4}".format(
+                        train_loss / len(train_loader),
+                        val_loss / len(self.valid_loader),
+                        train_recon_loss / len(train_loader),
+                        train_recon_loss_source / len(train_loader),
+                        train_recon_loss_target / len(train_loader),
+                    )],
+                    fmt="%s",
+                )
+
+            csv_to_figdata(
+                file_path=self.log_path,
+                column_heading_list=self.column_heading_list,
+                ylabel="loss",
+                fig_count=len(self.column_heading_list),
+                cut_first_epoch=True,
+            )
+
+            self.fit_anomaly_score_distribution(
+                y_pred=y_pred,
+                score_distr_file_path=self.mse_score_distr_file_path,
+            )
+
+        # save model
+        torch.save(self.model.state_dict(), self.model_path)
+        torch.save(
+            {
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'loss': self.loss,
+            },
+            self.checkpoint_path,
         )
-        print(
-            f"Mahal range: {mahal.min().item():.6f} -> {mahal.max().item():.6f}"
-        )
 
 
-# =========================================================
-# ALIASES
-# =========================================================
+# aliases
 FRAE = FRAEV4
 FRAEV2 = FRAEV4
 FRAEV3 = FRAEV4

@@ -2,7 +2,7 @@
 --result_directory: ./results
 --export_dir: baseline
 
---use_cuda: FALSE
+--use_cuda: TRUEs
 --log_interval: 100
 ##--model: DCASE2023T2-AE FRAME CNN
 --model: FRAE_DANN
@@ -26,7 +26,7 @@
 
 # fit
 --batch_size: 256
---epochs: 100
+--epochs: 60
 -lr: 0.001
 --shuffle: True
 --validation_split: 0.1

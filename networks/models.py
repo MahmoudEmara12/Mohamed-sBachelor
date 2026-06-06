@@ -5,6 +5,7 @@ from networks.frae_dann import FRAE_DANN
 from networks.frae import FRAE
 from networks.conformer import Conformer
 from networks.panns import PANNS
+from networks.vaae import VAAE
 class Models:
     ModelsDic = {
         "DCASE2023T2-AE":DCASE2023T2AE,
@@ -14,6 +15,8 @@ class Models:
         "FRAE": FRAE,
         "Conformer": Conformer,
         "PANNS": PANNS,
+        "VAAE": VAAE,
+
     }
 
     def __init__(self,models_str):

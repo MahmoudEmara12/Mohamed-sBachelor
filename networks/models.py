@@ -4,6 +4,7 @@ from networks.Cnn import CNN
 from networks.frae_dann import FRAE_DANN
 from networks.frae import FRAE
 from networks.conformer import Conformer
+from networks.panns import PANNS
 class Models:
     ModelsDic = {
         "DCASE2023T2-AE":DCASE2023T2AE,
@@ -12,6 +13,7 @@ class Models:
         "FRAE_DANN": FRAE_DANN,
         "FRAE": FRAE,
         "Conformer": Conformer,
+        "PANNS": PANNS,
     }
 
     def __init__(self,models_str):

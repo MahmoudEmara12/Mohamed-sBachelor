@@ -13,9 +13,6 @@ from networks.criterion.mahala import cov_v, loss_function_mahala, calc_inv_cov
 from tools.plot_loss_curve import csv_to_figdata
 
 
-# =========================================================
-# AUGMENTATION
-# =========================================================
 
 def augment(x, frames, n_mels):
     """Light SpecAugment-style augmentation."""
@@ -32,9 +29,6 @@ def augment(x, frames, n_mels):
     return x
 
 
-# =========================================================
-# RESIDUAL BLOCK
-# =========================================================
 
 class ResBlock(nn.Module):
     def __init__(self, dim, dropout=0.1):
@@ -53,9 +47,6 @@ class ResBlock(nn.Module):
         return x + residual
 
 
-# =========================================================
-# ENCODER
-# =========================================================
 
 class Encoder(nn.Module):
     def __init__(self, input_dim, hidden=512, latent_dim=64):
@@ -80,9 +71,6 @@ class Encoder(nn.Module):
         return self.head(h)
 
 
-# =========================================================
-# DECODER
-# =========================================================
 
 class Decoder(nn.Module):
     def __init__(self, latent_dim, hidden=512, output_dim=640, skip_dim=32):
@@ -106,9 +94,6 @@ class Decoder(nn.Module):
         return self.head(h)
 
 
-# =========================================================
-# FRAME NETWORK
-# =========================================================
 
 class FRAMENet(nn.Module):
     def __init__(self, input_dim, frames, n_mels, cov_dim, latent_dim=64, hidden=512):
@@ -136,8 +121,6 @@ class FRAMENet(nn.Module):
         )
 
         self.freq_weights = nn.Parameter(torch.linspace(0.8, 1.5, n_mels))
-
-        # Required by the repo's Mahalanobis utilities
         self.register_buffer("cov_source", torch.eye(cov_dim))
         self.register_buffer("cov_target", torch.eye(cov_dim))
 
@@ -148,9 +131,6 @@ class FRAMENet(nn.Module):
         return recon, z
 
 
-# =========================================================
-# FRAME MODEL
-# =========================================================
 
 class FRAME(DCASE2023T2AE):
     def __init__(self, args, train=True, test=False):
@@ -204,7 +184,6 @@ class FRAME(DCASE2023T2AE):
         return torch.sum(score) / n_loss
 
     def _freq_weights(self):
-        # Detached for covariance / scoring so those spaces are fixed.
         return F.softmax(self.model.freq_weights.detach(), dim=0)
 
     def _weighted_flat(self, x):
@@ -223,7 +202,6 @@ class FRAME(DCASE2023T2AE):
         x_2d = x.reshape(x.size(0), self.args.frames, self.args.n_mels)
         recon_2d = recon_x.reshape(recon_x.size(0), self.args.frames, self.args.n_mels)
 
-        # Trainable weights for the reconstruction objective.
         weights = F.softmax(self.model.freq_weights, dim=0)
         loss = ((x_2d - recon_2d) ** 2) * weights.unsqueeze(0).unsqueeze(0)
 
@@ -245,7 +223,6 @@ class FRAME(DCASE2023T2AE):
         diff = torch.sub(mat, mu)
         cov = cov_v(diff, mat.size(0))
 
-        # Small jitter for numerical stability before inversion.
         cov = cov + 1e-6 * torch.eye(cov.size(0), device=device, dtype=torch.float32)
         return cov
 
@@ -253,7 +230,6 @@ class FRAME(DCASE2023T2AE):
         data = data.to(self.device).float()
         recon_data, _ = self.model(data)
 
-        # Score in the same weighted residual space used for covariance.
         data_w = self._weighted_flat(data)
         recon_w = self._weighted_flat(recon_data)
 
@@ -290,9 +266,6 @@ class FRAME(DCASE2023T2AE):
         if epoch <= self.epoch:
             return
 
-        # Disable anomaly detection in production — re-enable only for debugging
-        # torch.autograd.set_detect_anomaly(True)
-
         train_loss = 0
         train_recon_loss = 0
         train_recon_loss_source = 0
@@ -301,7 +274,7 @@ class FRAME(DCASE2023T2AE):
 
         train_loader = self.train_loader
 
-        # Original repo-style covariance pass
+        
         if epoch == self.args.epochs + 1:
             print("\n============== CALCULATE COVARIANCE ==============")
             is_calc_cov = True
@@ -395,8 +368,7 @@ class FRAME(DCASE2023T2AE):
                     recon1, z1 = self.model(x1)
                     recon2, z2 = self.model(x2)
 
-                    # FIX 1: Guard z1/z2 against NaN/Inf BEFORE computing var()
-                    # (AMP or unstable early training can produce NaN activations)
+                    
                     z1 = torch.nan_to_num(z1, nan=0.0, posinf=1e4, neginf=-1e4)
                     z2 = torch.nan_to_num(z2, nan=0.0, posinf=1e4, neginf=-1e4)
 
@@ -406,7 +378,7 @@ class FRAME(DCASE2023T2AE):
 
                     consistency_loss = F.mse_loss(z1, z2)
 
-                    # FIX 2: Corrected copy-paste bug — z1_var and z2_var are now independent
+                
                     z1_var = torch.var(z1, dim=0, unbiased=False)
                     z1_var = torch.nan_to_num(z1_var, nan=0.0, posinf=0.0, neginf=0.0)
                     z2_var = torch.var(z2, dim=0, unbiased=False)
@@ -525,6 +497,3 @@ class FRAME(DCASE2023T2AE):
             self.checkpoint_path,
         )
 
-
-# alias
-FRAMEv1 = FRAME

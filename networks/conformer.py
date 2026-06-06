@@ -540,5 +540,3 @@ class Conformer(DCASE2023T2AE):
         }, self.checkpoint_path)
 
 
-# alias
-Conformerv1 = Conformer

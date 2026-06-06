@@ -190,7 +190,7 @@ def safe_input(x):
 # =========================================================
 # FRAE V4
 # =========================================================
-class FRAEV4(DCASE2023T2AE):
+class FRAEV(DCASE2023T2AE):
 
     def __init__(self, args, train=True, test=False):
 
@@ -586,7 +586,3 @@ class FRAEV4(DCASE2023T2AE):
         )
 
 
-# aliases
-FRAE = FRAEV4
-FRAEV2 = FRAEV4
-FRAEV3 = FRAEV4

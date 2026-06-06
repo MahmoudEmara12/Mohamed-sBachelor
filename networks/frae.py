@@ -187,10 +187,7 @@ def safe_input(x):
     
 
 
-# =========================================================
-# FRAE V4
-# =========================================================
-class FRAEV(DCASE2023T2AE):
+class FRAE(DCASE2023T2AE):
 
     def __init__(self, args, train=True, test=False):
 
@@ -289,7 +286,6 @@ class FRAEV(DCASE2023T2AE):
 
     # =====================================================
     # TRAIN
-    # Baseline protocol + FRAE v4 objective
     # =====================================================
     def train(self, epoch):
         if epoch <= self.epoch:

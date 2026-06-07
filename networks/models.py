@@ -1,6 +1,6 @@
 from networks.dcase2023t2_ae.dcase2023t2_ae import DCASE2023T2AE
 from networks.my_model import FRAME
-from networks.Cnn import CNN
+from networks.cnn import CNN
 from networks.frae_dann import FRAE_DANN
 from networks.frae import FRAE
 from networks.conformer import Conformer

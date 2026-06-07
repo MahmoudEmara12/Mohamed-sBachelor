@@ -1,28 +1,4 @@
-"""
-CFMA — Convolutional Frequency-Masked Autoencoder
-==================================================
 
-Drop-in model file for the DCASE2023 Task 2 repo.
-
-KNOWN ISSUES OBSERVED IN FRAME — fixed here:
-  1. Boolean list indexing:
-       score[is_source_list] where is_source_list is a Python bool list
-       → PyTorch treats True/False as int 1/0, doing integer indexing
-         instead of boolean masking. Fixed: wrap in torch.tensor(..., dtype=torch.bool)
-
-  2. Covariance/scoring space: the covariance is accumulated from UNWEIGHTED
-       diff = x - recon_x reshaped to (-1, n_mels). The Mahalanobis scoring
-       also uses unweighted residuals (via loss_function_mahala). Consistent.
-       The MSE score uses frequency-weighted residuals via loss_fn. Also
-       consistent within itself. The two scores live in different spaces —
-       that is expected and fine. Documented explicitly below.
-
-  3. Mahalanobis (N×N) matrix: loss_function_mahala with reduction=False
-       returns the full cross-distance matrix (N×N), not per-sample diagonals.
-       loss_reduction_1d takes mean(dim=1) = row means, not diagonal.
-       This is the same behaviour as the baseline — left unchanged for
-       consistency/comparability, but documented.
-"""
 
 import numpy as np
 import torch
@@ -37,26 +13,13 @@ from networks.dcase2023t2_ae.dcase2023t2_ae import DCASE2023T2AE
 from networks.criterion.mahala import cov_v, loss_function_mahala, calc_inv_cov
 from tools.plot_loss_curve import csv_to_figdata
 
-
-# =========================================================
-# HELPERS
-# =========================================================
-
 def _to_bool_mask(flag_list, device):
-    """
-    Convert a Python bool list to a torch bool tensor for correct masking.
-
-    WHY THIS EXISTS:
-    PyTorch fancy-indexes with Python bool lists by treating True→1, False→0
-    as INTEGER indices, not as a boolean mask.
-      e.g.  score[[True, False, True]] == score[[1, 0, 1]]  ← WRONG
-    Passing a torch.bool tensor instead gives proper boolean masking.
-    """
+   
     return torch.tensor(flag_list, dtype=torch.bool, device=device)
 
 
 def augment(x, frames, n_mels):
-    """Amplitude jitter + gaussian noise + frequency roll."""
+
     scale = torch.empty(x.size(0), 1, device=x.device).uniform_(0.9, 1.1)
     x = x * scale
     x = x + torch.randn_like(x) * 0.01
@@ -105,10 +68,6 @@ class Encoder(nn.Module):
         x = x.view(B, 1, self.frames, self.n_mels)
         h = self.net(x).view(B, -1)
         return self.embedding(h)
-        # NOTE: No F.normalize here.
-        # FRAME uses unnormalized z; we match that so the Mahalanobis
-        # covariance (built on x - recon_x, not on z) is comparable.
-
 
 # =========================================================
 # DECODER
@@ -132,19 +91,7 @@ class Decoder(nn.Module):
 # =========================================================
 
 class CFMANet(nn.Module):
-    """
-    PyTorch module.
-
-    Framework contracts:
-      - forward() returns (recon, z)
-      - cov_source, cov_target are registered buffers of shape (n_mels, n_mels)
-        so calc_inv_cov() can read them.
-
-    Mahalanobis space note:
-      The covariance matrices live in n_mels-dimensional space because
-      loss_function_mahala reshapes residuals to (-1, block_size=n_mels).
-      This is the same space the baseline AENet uses.
-    """
+    
 
     def __init__(self, input_dim, frames, n_mels, latent_dim=32):
         super().__init__()
@@ -154,8 +101,6 @@ class CFMANet(nn.Module):
         self.encoder = Encoder(frames, n_mels, latent_dim)
         self.decoder = Decoder(latent_dim, input_dim)
 
-        # Frequency weights used only for the MSE score path.
-        # The Mahalanobis path uses raw residuals (see loss_function_mahala).
         self.freq_weights = nn.Parameter(torch.linspace(0.8, 1.2, n_mels))
 
         # Required by calc_inv_cov — shape (n_mels, n_mels)
@@ -173,10 +118,7 @@ class CFMANet(nn.Module):
 # =========================================================
 
 class CNN(DCASE2023T2AE):
-    """
-    CFMA wrapped as a DCASE2023 Task 2 model.
-    Inherits test / eval / ROC / pAUC / threshold / CSV logic from DCASE2023T2AE.
-    """
+    
 
     def __init__(self, args, train=True, test=False):
         super().__init__(args=args, train=train, test=test)
@@ -194,9 +136,6 @@ class CNN(DCASE2023T2AE):
         self.use_amp = bool(torch.cuda.is_available() and self.device.type == "cuda")
         self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-    # ----------------------------------------------------------
-    # init_model — called by BaseModel.__init__
-    # ----------------------------------------------------------
 
     def init_model(self):
         latent_dim = getattr(self.args, "latent_dim", 32)
@@ -221,24 +160,8 @@ class CNN(DCASE2023T2AE):
         ]
         return "loss,val_loss,recon_loss,recon_loss_source,recon_loss_target"
 
-    # ----------------------------------------------------------
-    # Loss helpers
-    # loss_fn:  WEIGHTED MSE  → (B, frames*n_mels)   [MSE score path]
-    # The Mahalanobis path uses UNWEIGHTED residuals inside
-    # loss_function_mahala — that is consistent with how cov is built.
-    # ----------------------------------------------------------
 
     def loss_fn(self, recon_x, x):
-        """
-        Frequency-weighted MSE. Returns unreduced (B, frames*n_mels).
-        Used for the MSE anomaly score and training loss.
-
-        NOTE on space: weighted by freq_weights over the n_mels axis.
-        The Mahalanobis covariance is built on UNWEIGHTED residuals
-        (inside loss_function_mahala). Do NOT mix scores across score
-        types in comparisons — use --score MSE or --score MAHALA
-        consistently.
-        """
         x_2d = x.view(x.size(0), self.args.frames, self.args.n_mels)
         r_2d = recon_x.view(recon_x.size(0), self.args.frames, self.args.n_mels)
         weights = F.softmax(self.model.freq_weights, dim=0)
@@ -246,11 +169,9 @@ class CNN(DCASE2023T2AE):
         return loss.view(loss.size(0), -1)   # (B, frames*n_mels)
 
     def loss_reduction_1d(self, score):
-        """(B, D) → (B,)  or  (N, N) → (N,)  [row-means, same as baseline]"""
         return torch.mean(score, dim=1)
 
     def loss_reduction(self, score, n_loss):
-        """(B,) → scalar"""
         return torch.sum(score) / n_loss
 
     # ----------------------------------------------------------
@@ -260,9 +181,6 @@ class CNN(DCASE2023T2AE):
     def calc_valid_mahala_score(self, data, y_pred, inv_cov_source, inv_cov_target):
         data = data.to(self.device).float()
         recon_data, _ = self.model(data)
-
-        # Mahalanobis uses UNWEIGHTED residuals via loss_function_mahala —
-        # same space the covariance was built in. Consistent.
         loss_source, num = loss_function_mahala(
             recon_x=recon_data, x=data,
             block_size=self.block_size,
@@ -332,10 +250,6 @@ class CNN(DCASE2023T2AE):
             n_source = is_source_list_py.count(True)
             n_target = is_target_list_py.count(True)
 
-            # FIX (Issue 1): convert Python bool lists to torch bool tensors
-            # BEFORE any tensor indexing. Python bool lists used as tensor
-            # indices are treated as integers (True→1, False→0), causing
-            # wrong rows to be selected.
             src_mask = _to_bool_mask(is_source_list_py, device=self.device)
             tgt_mask = _to_bool_mask(is_target_list_py, device=self.device)
 
@@ -344,16 +258,7 @@ class CNN(DCASE2023T2AE):
 
             recon_batch, z = self.model(data)
 
-            # ---- covariance accumulation ----
             if is_calc_cov:
-                # loss_function_mahala uses raw diff = x - recon_x (UNWEIGHTED).
-                # This sets the space for the Mahalanobis score. Consistent.
-                # Pass Python lists here because loss_function_mahala does its
-                # own indexing internally (diff[is_source_list]).
-                # We pass the original Python bool lists — same bug exists
-                # inside loss_function_mahala itself (not our code to fix),
-                # but we document it. The cov_diff_* tensors come back already
-                # indexed, so we apply our fix to everything we index ourselves.
                 score_2d, cov_diff_source, cov_diff_target = loss_function_mahala(
                     recon_x=recon_batch, x=data,
                     block_size=self.block_size,
@@ -390,7 +295,6 @@ class CNN(DCASE2023T2AE):
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
 
-            # ---- bookkeeping (FIX: use bool tensor masks, not Python lists) ----
             n_loss = len(score_2d)
             score = self.loss_reduction_1d(score_2d)   # (B,)
 

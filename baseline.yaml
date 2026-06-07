@@ -6,7 +6,7 @@
 --log_interval: 100
 ##--model: DCASE2023T2-AE FRAME CNN
 --model: VAAE
---score: MAHALA
+--score: MSE
 --seed: 13711
 --is_auto_download: False
 

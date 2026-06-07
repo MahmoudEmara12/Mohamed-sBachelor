@@ -195,10 +195,7 @@ class FRAME(DCASE2023T2AE):
         return self._weighted_flat(x) - self._weighted_flat(recon_x)
 
     def loss_fn(self, recon_x, x):
-        """
-        Frequency-weighted MSE.
-        Must return unreduced tensor with shape (B, D).
-        """
+        
         x_2d = x.reshape(x.size(0), self.args.frames, self.args.n_mels)
         recon_2d = recon_x.reshape(recon_x.size(0), self.args.frames, self.args.n_mels)
 
@@ -208,10 +205,6 @@ class FRAME(DCASE2023T2AE):
         return loss.reshape(loss.size(0), -1)
 
     def _cov_from_rows(self, rows, device):
-        """
-        Build an unbiased covariance from a list of 2D tensors with shape (N_i, D).
-        Returns a (D, D) matrix.
-        """
         if len(rows) == 0:
             return torch.eye(self.block_size, device=device, dtype=torch.float32)
 

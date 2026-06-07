@@ -257,7 +257,6 @@ def contrastive_loss(
 
 # =========================================================
 # FRAE_DANN MODEL WRAPPER
-# Keeps the DCASE2023T2AE evaluation pipeline unchanged.
 # =========================================================
 class FRAE_DANN(DCASE2023T2AE):
 
@@ -306,9 +305,6 @@ class FRAE_DANN(DCASE2023T2AE):
 
     # -----------------------------------------------------
     # TRAIN
-    # Same covariance / validation / score-distribution flow
-    # as the DCASE baseline, with extra DANN + contrastive loss
-    # during the normal training phase only.
     # -----------------------------------------------------
     def train(self, epoch):
         if epoch <= self.epoch:

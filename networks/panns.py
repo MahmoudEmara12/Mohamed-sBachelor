@@ -49,7 +49,6 @@ class _ConvBlock(nn.Module):
 
 
 class Cnn14(nn.Module):
-    """CNN14 feature extractor.  Input: (B, 1, T, 64)  -> Output: (B, 2048)."""
 
     def __init__(self):
         super().__init__()
@@ -93,11 +92,7 @@ class Cnn14(nn.Module):
 
 
 def _load_audio(path: str):
-    """
-    Load an audio file as a (channels, samples) float32 tensor.
-    Uses soundfile directly so it works even when torchaudio's TorchCodec
-    backend is not installed (common on Windows / older torchaudio builds).
-    """
+    
     try:
         wav, sr = torchaudio.load(path)
         return wav, sr
@@ -109,7 +104,6 @@ def _load_audio(path: str):
 
 
 def _load_panns_weights(model: Cnn14, ckpt_path: str):
-    """Load PANNs checkpoint into Cnn14, tolerating minor key mismatches."""
     if not os.path.exists(ckpt_path):
         print(
             f"[WARN] CNN14 checkpoint not found at '{ckpt_path}'.\n"
@@ -313,7 +307,6 @@ class PANNS(BaseModel):
 
 
     def _scan_train_files(self):
-        """Return (source_wav_list, target_wav_list) from the training directory."""
         train_dir = self._audio_root / "train"
         if not train_dir.exists():
             raise FileNotFoundError(f"Training audio directory not found: {train_dir}")
@@ -327,14 +320,13 @@ class PANNS(BaseModel):
         return src, tgt
 
     def _embed_files(self, files: list, desc: str = "") -> np.ndarray:
-        """Embed a list of audio files ->numpy array of shape (N, 2048)."""
         if not files:
             return np.empty((0, 2048), dtype=np.float32)
         embs = [self._embed(f) for f in tqdm(files, desc=f"CNN14 [{desc}]")]
         return np.array(embs, dtype=np.float32)
 
     def _embed(self, audio_path) -> np.ndarray:
-        """Load one audio file ->2048-dim CNN14 embedding (numpy, CPU)."""
+
         wav, sr = _load_audio(str(audio_path))   
         if wav.shape[0] > 1:                      
             wav = wav.mean(0, keepdim=True)
@@ -352,11 +344,7 @@ class PANNS(BaseModel):
         return emb.cpu().numpy()
 
     def _fit_gaussians(self, src_embs: np.ndarray, tgt_embs: np.ndarray) -> dict:
-        """
-        Fit PCA + regularised source Gaussian; compute target mean.
-
-        Returns a dict with keys: pca, src_mean, prec, tgt_mean
-        """
+       
         n_src = src_embs.shape[0]
         n_tgt = tgt_embs.shape[0]
         print(f"Fitting Gaussians: {n_src} source, {n_tgt} target embeddings")
@@ -392,7 +380,6 @@ class PANNS(BaseModel):
         }
 
     def _score(self, emb: np.ndarray, gparams: dict, domain: str = "source") -> float:
-        """Mahalanobis distance to the domain-specific Gaussian. Higher = more anomalous."""
         e    = gparams["pca"].transform(emb.reshape(1, -1))[0].astype(np.float32)
         p    = gparams["prec"]
         mean = gparams["tgt_mean"] if domain == "target" else gparams["src_mean"]

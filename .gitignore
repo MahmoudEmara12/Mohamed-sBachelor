@@ -1,0 +1,10 @@
+data/
+models/saved_model/
+models/pretrained/
+results/
+__pycache__/
+*.pyc
+*.pickle
+*.pth
+*.log
+*.pt
